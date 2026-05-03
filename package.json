@@ -1,0 +1,72 @@
+{
+  "name": "ocpp-kit",
+  "version": "0.1.0",
+  "description": "Type-safe OCPP 1.6-J toolkit for Node.js: RPC framing, Central System server, Charge Point client and a charge-point simulator for load testing.",
+  "keywords": [
+    "ocpp",
+    "ocpp16",
+    "ocpp-j",
+    "ev-charging",
+    "csms",
+    "charge-point",
+    "websocket",
+    "simulator",
+    "typescript"
+  ],
+  "license": "MIT",
+  "author": "Houssam Mehdi",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/houssammehdi/ocpp-kit.git"
+  },
+  "type": "module",
+  "engines": {
+    "node": ">=20"
+  },
+  "main": "./dist/index.js",
+  "types": "./dist/index.d.ts",
+  "exports": {
+    ".": {
+      "types": "./dist/index.d.ts",
+      "import": "./dist/index.js"
+    },
+    "./package.json": "./package.json"
+  },
+  "bin": {
+    "ocpp-kit": "./dist/cli/main.js"
+  },
+  "files": [
+    "dist",
+    "README.md",
+    "LICENSE"
+  ],
+  "sideEffects": false,
+  "scripts": {
+    "build": "tsup",
+    "lint": "eslint .",
+    "typecheck": "tsc --noEmit",
+    "test": "vitest run",
+    "test:watch": "vitest",
+    "format": "prettier --write .",
+    "format:check": "prettier --check .",
+    "example:csms": "tsx examples/basic-csms.ts",
+    "example:charge-point": "tsx examples/basic-charge-point.ts",
+    "example:smart-charging": "tsx examples/smart-charging.ts"
+  },
+  "dependencies": {
+    "@sinclair/typebox": "^0.34.52",
+    "ws": "^8.21.3"
+  },
+  "devDependencies": {
+    "@eslint/js": "^9.39.5",
+    "@types/node": "^20.19.43",
+    "@types/ws": "^8.18.1",
+    "eslint": "^9.39.5",
+    "prettier": "^3.9.9",
+    "tsup": "^8.5.1",
+    "tsx": "^4.23.15",
+    "typescript": "~5.9.3",
+    "typescript-eslint": "^8.70.1",
+    "vitest": "~4.0.18"
+  }
+}
