@@ -67,3 +67,42 @@ export async function flush(times = 10): Promise<void> {
 }
 
 export const NOW = '2026-03-01T10:00:00.000Z';
+
+interface HasEvents {
+  readonly eventTypes?: object;
+}
+type EventsOf<T extends HasEvents> = NonNullable<T['eventTypes']>;
+type Args<F> = F extends (...args: infer A) => void ? A : never;
+
+/** Resolve with the arguments of the next `event` emitted by a typed emitter. */
+export function nextEvent<T extends HasEvents, K extends keyof EventsOf<T> & string>(
+  emitter: T,
+  event: K,
+  timeoutMs = 5_000,
+): Promise<Args<EventsOf<T>[K]>> {
+  return new Promise((resolve, reject) => {
+    const timer = setTimeout(() => {
+      reject(new Error(`Timed out waiting for "${event}"`));
+    }, timeoutMs);
+    const target = emitter as unknown as {
+      once(event: string, listener: (...args: unknown[]) => void): void;
+    };
+    target.once(event, (...args: unknown[]) => {
+      clearTimeout(timer);
+      resolve(args as Args<EventsOf<T>[K]>);
+    });
+  });
+}
+
+/** Poll `predicate` until it holds. */
+export async function until(
+  predicate: () => boolean,
+  timeoutMs = 5_000,
+  stepMs = 5,
+): Promise<void> {
+  const deadline = Date.now() + timeoutMs;
+  while (!predicate()) {
+    if (Date.now() > deadline) throw new Error('Condition not met in time');
+    await new Promise((resolve) => setTimeout(resolve, stepMs));
+  }
+}

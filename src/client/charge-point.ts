@@ -1,0 +1,425 @@
+import {
+  CentralSystemToChargePoint,
+  ChargePointToCentralSystem,
+  isTransactionAction,
+  type ChargePointAction,
+  type ChargePointRequest,
+  type ChargePointResponse,
+} from '../messages/index.js';
+import type { Duplex } from '../rpc/duplex.js';
+import { CallTimeoutError, ConnectionClosedError, OcppKitError, RpcError } from '../rpc/errors.js';
+import type { JsonObject } from '../rpc/frames.js';
+import {
+  HandlerRegistry,
+  RpcPeer,
+  type CallOptions,
+  type CompletedCallEvent,
+  type RequestHandler,
+} from '../rpc/peer.js';
+import { validatePayload, type ActionName } from '../rpc/validation.js';
+import { basicAuthHeader } from '../server/auth.js';
+import { OCPP16_SUBPROTOCOL } from '../transport/websocket.js';
+import { TypedEventEmitter } from '../util/typed-emitter.js';
+import { backoffDelay, DEFAULT_BACKOFF, type BackoffOptions } from './backoff.js';
+import { webSocketConnector, type Connector } from './connector.js';
+import {
+  MemoryQueueStore,
+  OfflineQueue,
+  type OfflineQueueStore,
+  type QueuedMessage,
+} from './offline-queue.js';
+
+type Inbound = typeof CentralSystemToChargePoint;
+type Outbound = typeof ChargePointToCentralSystem;
+
+/** Context passed to every Charge Point handler. */
+export interface ChargePointHandlerContext {
+  readonly chargePoint: ChargePoint;
+}
+
+/** Reconnect policy of {@link ChargePoint}. */
+export interface ReconnectOptions extends BackoffOptions {
+  /** Give up after this many consecutive failed attempts. Default: unlimited. */
+  readonly maxAttempts?: number;
+  /**
+   * A connection must stay up this long before the backoff counter resets, so a server that
+   * accepts and immediately drops connections is not hammered. Default: 10 000 ms.
+   */
+  readonly resetAfterMs?: number;
+}
+
+/** Options of {@link ChargePoint}. */
+export interface ChargePointOptions {
+  /** Charge point identity, appended to `url` as the last path segment. */
+  readonly identity: string;
+  /** Central System endpoint without the identity, e.g. `ws://localhost:9220/ocpp`. */
+  readonly url: string;
+  /** Security Profile 1 password (HTTP Basic auth with the identity as username). */
+  readonly password?: string;
+  /** Default CALL timeout. Default: 30 000 ms. */
+  readonly callTimeoutMs?: number;
+  /** WebSocket handshake timeout. Default: 10 000 ms. */
+  readonly handshakeTimeoutMs?: number;
+  /** Reconnect policy, or `false` to disable automatic reconnects. */
+  readonly reconnect?: ReconnectOptions | false;
+  /**
+   * Offline queue for StartTransaction, StopTransaction and MeterValues, or `false` to send them
+   * like any other message. Default: in-memory store, 10 000 messages.
+   */
+  readonly offlineQueue?: { readonly store?: OfflineQueueStore; readonly maxSize?: number } | false;
+  /**
+   * Attempts per transaction message when the Central System answers with CALLERROR or does not
+   * answer in time (`TransactionMessageAttempts`). Connection loss does not count. Default: 3.
+   */
+  readonly transactionMessageAttempts?: number;
+  /**
+   * Base wait between attempts; attempt `n` waits `n` times this value
+   * (`TransactionMessageRetryInterval`). Default: 5 000 ms.
+   */
+  readonly transactionMessageRetryIntervalMs?: number;
+  /** Uniform random source used for backoff jitter. Default: `Math.random`. */
+  readonly random?: () => number;
+  /** Transport factory. Default: `ws` WebSocket connector. */
+  readonly connector?: Connector;
+  readonly validateInbound?: boolean;
+  readonly validateOutbound?: boolean;
+}
+
+/** Connection lifecycle state. */
+export type ChargePointState = 'idle' | 'connecting' | 'open' | 'reconnecting' | 'closed';
+
+/** Events emitted by {@link ChargePoint}. */
+export interface ChargePointEvents {
+  open: () => void;
+  close: (code: number, reason: string) => void;
+  /** A reconnect is scheduled after `delayMs`; `attempt` starts at 1. */
+  reconnecting: (attempt: number, delayMs: number) => void;
+  connectFailed: (error: Error, attempt: number) => void;
+  /** A queued transaction message was delivered. */
+  delivered: (message: QueuedMessage, response: JsonObject) => void;
+  /** A queued transaction message was abandoned after exhausting its attempts or evicted. */
+  dropped: (message: QueuedMessage, error: Error) => void;
+  /** Every outbound CALL that settled, with its round-trip time. */
+  callCompleted: (event: CompletedCallEvent) => void;
+  message: (direction: 'in' | 'out', raw: string) => void;
+}
+
+/** A call could not be sent because the client is not connected. */
+export class NotConnectedError extends OcppKitError {
+  constructor(readonly action: string) {
+    super(`Cannot send ${action}: not connected`);
+  }
+}
+
+interface Deferred {
+  readonly resolve: (value: JsonObject) => void;
+  readonly reject: (error: Error) => void;
+}
+
+/**
+ * An OCPP 1.6-J Charge Point client.
+ *
+ * - Reconnects automatically with exponential backoff and full jitter.
+ * - Delivers StartTransaction, StopTransaction and MeterValues reliably: they are persisted in an
+ *   offline queue and replayed in order after reconnecting, with bounded retries on CALLERROR.
+ * - Other messages are sent immediately and fail fast with {@link NotConnectedError} when offline.
+ */
+export class ChargePoint extends TypedEventEmitter<ChargePointEvents> {
+  /** Charge point identity. */
+  readonly identity: string;
+  readonly #options: ChargePointOptions;
+  readonly #handlers = new HandlerRegistry<Inbound, ChargePointHandlerContext>();
+  readonly #queue: OfflineQueue | undefined;
+  readonly #deferred = new Map<number, Deferred>();
+  readonly #attempts = new Map<number, number>();
+  readonly #connector: Connector;
+  #peer: RpcPeer<Inbound, Outbound, ChargePointHandlerContext> | undefined;
+  #state: ChargePointState = 'idle';
+  #stopped = false;
+  #draining = false;
+  #running: Promise<void> | undefined;
+  readonly #wakers = new Set<() => void>();
+  #connectWaiters: Deferred[] = [];
+
+  constructor(options: ChargePointOptions) {
+    super();
+    this.identity = options.identity;
+    this.#options = options;
+    this.#connector = options.connector ?? webSocketConnector;
+    if (options.offlineQueue !== false) {
+      this.#queue = new OfflineQueue(
+        options.offlineQueue?.store ?? new MemoryQueueStore(),
+        options.offlineQueue?.maxSize,
+      );
+    }
+  }
+
+  /** Current lifecycle state. */
+  get state(): ChargePointState {
+    return this.#state;
+  }
+
+  /** Whether the client is connected right now. */
+  get isConnected(): boolean {
+    return this.#peer?.isOpen ?? false;
+  }
+
+  /** Number of transaction messages waiting for delivery. */
+  get queueSize(): number {
+    return this.#queue?.size ?? 0;
+  }
+
+  /** Endpoint URL including the identity. */
+  get endpoint(): string {
+    return `${this.#options.url.replace(/\/+$/, '')}/${encodeURIComponent(this.identity)}`;
+  }
+
+  /** Register a typed handler for a Central System initiated action. */
+  handle<A extends ActionName<Inbound>>(
+    action: A,
+    handler: RequestHandler<Inbound, A, ChargePointHandlerContext>,
+  ): this {
+    this.#handlers.set(action, handler);
+    return this;
+  }
+
+  /**
+   * Connect (retrying per the reconnect policy) and resolve once the first connection is open.
+   * Loads persisted offline messages first so they are replayed right after connecting.
+   */
+  async connect(): Promise<void> {
+    if (this.#stopped) throw new OcppKitError('ChargePoint has been closed');
+    if (this.isConnected) return;
+    const opened = new Promise<void>((resolve, reject) => {
+      this.#connectWaiters.push({ resolve: () => resolve(), reject });
+    });
+    if (!this.#running) {
+      await this.#queue?.init();
+      this.#running = this.#run();
+    }
+    return opened;
+  }
+
+  /**
+   * Send a typed CALL to the Central System.
+   *
+   * Transaction-related actions go through the offline queue: the promise resolves once the
+   * message has been delivered, which may be after one or more reconnects.
+   */
+  call<A extends ChargePointAction>(
+    action: A,
+    payload: ChargePointRequest<A>,
+    options?: CallOptions,
+  ): Promise<ChargePointResponse<A>> {
+    if (this.#queue && isTransactionAction(action)) {
+      return this.#enqueue(action, payload);
+    }
+    const peer = this.#peer;
+    if (!peer?.isOpen) return Promise.reject(new NotConnectedError(action));
+    return peer.call(action, payload, options);
+  }
+
+  /**
+   * Stop reconnecting and close the connection. Queued messages stay in the store (and are
+   * replayed by the next client using the same store); their pending promises reject.
+   */
+  async close(code = 1000, reason = ''): Promise<void> {
+    this.#stopped = true;
+    for (const wake of [...this.#wakers]) wake();
+    const peer = this.#peer;
+    if (peer) await peer.close(code, reason);
+    await this.#running;
+    this.#state = 'closed';
+    const closed = new ConnectionClosedError(code, reason || 'Client closed');
+    for (const deferred of this.#deferred.values()) deferred.reject(closed);
+    this.#deferred.clear();
+    for (const waiter of this.#connectWaiters.splice(0)) waiter.reject(closed);
+  }
+
+  async #enqueue(action: QueuedMessage['action'], payload: JsonObject): Promise<JsonObject> {
+    const queue = this.#queue;
+    if (!queue) throw new OcppKitError('Offline queue disabled');
+    if (this.#options.validateOutbound ?? true) {
+      const error = validatePayload(
+        ChargePointToCentralSystem[action].request,
+        payload,
+        `${action} request`,
+      );
+      if (error) throw error;
+    }
+    if (this.#stopped) throw new ConnectionClosedError(1000, 'Client closed');
+    const { message, evicted } = await queue.push(action, payload);
+    if (evicted) {
+      const error = new OcppKitError('Evicted from a full offline queue');
+      this.#deferred.get(evicted.seq)?.reject(error);
+      this.#deferred.delete(evicted.seq);
+      this.emit('dropped', evicted, error);
+    }
+    const delivered = new Promise<JsonObject>((resolve, reject) => {
+      this.#deferred.set(message.seq, { resolve, reject });
+    });
+    void this.#drain();
+    return delivered;
+  }
+
+  async #drain(): Promise<void> {
+    const queue = this.#queue;
+    if (!queue || this.#draining) return;
+    this.#draining = true;
+    const maxAttempts = this.#options.transactionMessageAttempts ?? 3;
+    const retryInterval = this.#options.transactionMessageRetryIntervalMs ?? 5_000;
+    try {
+      for (;;) {
+        const peer = this.#peer;
+        const head = queue.peek();
+        if (!peer?.isOpen || !head || this.#stopped) return;
+        try {
+          const response = await peer.call(head.action, head.payload as never);
+          await this.#settleQueued(head, response);
+        } catch (error) {
+          if (error instanceof ConnectionClosedError) return;
+          const attempts = (this.#attempts.get(head.seq) ?? 0) + 1;
+          const retryable = error instanceof RpcError || error instanceof CallTimeoutError;
+          if (!retryable || attempts >= maxAttempts) {
+            await this.#settleQueued(
+              head,
+              error instanceof Error ? error : new Error(String(error)),
+            );
+          } else {
+            this.#attempts.set(head.seq, attempts);
+            await this.#sleep(retryInterval * attempts);
+          }
+        }
+      }
+    } finally {
+      this.#draining = false;
+    }
+  }
+
+  async #settleQueued(message: QueuedMessage, outcome: JsonObject | Error): Promise<void> {
+    await this.#queue?.remove(message.seq);
+    this.#attempts.delete(message.seq);
+    const deferred = this.#deferred.get(message.seq);
+    this.#deferred.delete(message.seq);
+    if (outcome instanceof Error) {
+      deferred?.reject(outcome);
+      this.emit('dropped', message, outcome);
+    } else {
+      deferred?.resolve(outcome);
+      this.emit('delivered', message, outcome);
+    }
+  }
+
+  /** Re-reads the flag; TypeScript would otherwise keep its narrowing across `await`. */
+  #isStopped(): boolean {
+    return this.#stopped;
+  }
+
+  /** Wait `ms`, or less if {@link close} is called meanwhile. */
+  #sleep(ms: number): Promise<void> {
+    return new Promise((resolve) => {
+      const wake = (): void => {
+        clearTimeout(timer);
+        this.#wakers.delete(wake);
+        resolve();
+      };
+      const timer = setTimeout(wake, ms);
+      this.#wakers.add(wake);
+    });
+  }
+
+  #createPeer(duplex: Duplex): RpcPeer<Inbound, Outbound, ChargePointHandlerContext> {
+    const peer = new RpcPeer(duplex, {
+      inbound: CentralSystemToChargePoint,
+      outbound: ChargePointToCentralSystem,
+      handlers: this.#handlers,
+      context: { chargePoint: this },
+      ...(this.#options.callTimeoutMs === undefined
+        ? {}
+        : { callTimeoutMs: this.#options.callTimeoutMs }),
+      ...(this.#options.validateInbound === undefined
+        ? {}
+        : { validateInbound: this.#options.validateInbound }),
+      ...(this.#options.validateOutbound === undefined
+        ? {}
+        : { validateOutbound: this.#options.validateOutbound }),
+    });
+    peer.on('callCompleted', (event) => this.emit('callCompleted', event));
+    peer.on('message', (direction, raw) => this.emit('message', direction, raw));
+    return peer;
+  }
+
+  async #run(): Promise<void> {
+    const reconnect = this.#options.reconnect ?? {};
+    const backoff = reconnect === false ? DEFAULT_BACKOFF : { ...DEFAULT_BACKOFF, ...reconnect };
+    const resetAfterMs = (reconnect === false ? undefined : reconnect.resetAfterMs) ?? 10_000;
+    const maxAttempts = reconnect === false ? 1 : (reconnect.maxAttempts ?? Infinity);
+    const headers: Record<string, string> =
+      this.#options.password === undefined
+        ? {}
+        : { Authorization: basicAuthHeader(this.identity, this.#options.password) };
+    // Exponent of the next reconnect delay; reset once a connection has proven stable.
+    let backoffStep = 0;
+    // Consecutive failed connection attempts, bounded by maxAttempts.
+    let failures = 0;
+
+    while (!this.#stopped) {
+      this.#state = this.#state === 'idle' ? 'connecting' : 'reconnecting';
+      let duplex: Duplex;
+      try {
+        duplex = await this.#connector({
+          url: this.endpoint,
+          protocols: [OCPP16_SUBPROTOCOL],
+          headers,
+          handshakeTimeoutMs: this.#options.handshakeTimeoutMs ?? 10_000,
+        });
+      } catch (error) {
+        failures++;
+        const failure = error instanceof Error ? error : new Error(String(error));
+        this.emit('connectFailed', failure, failures);
+        if (reconnect === false || failures >= maxAttempts) {
+          for (const waiter of this.#connectWaiters.splice(0)) waiter.reject(failure);
+          break;
+        }
+        await this.#backoff(backoffStep++, backoff);
+        continue;
+      }
+      if (this.#isStopped()) {
+        duplex.close(1000, 'Client closed');
+        break;
+      }
+      failures = 0;
+
+      const peer = this.#createPeer(duplex);
+      const closed = new Promise<{ code: number; reason: string }>((resolve) => {
+        peer.once('close', (code, reason) => {
+          resolve({ code, reason });
+        });
+      });
+      const openedAt = Date.now();
+      this.#peer = peer;
+      this.#state = 'open';
+      this.emit('open');
+      for (const waiter of this.#connectWaiters.splice(0)) waiter.resolve({});
+      void this.#drain();
+
+      const { code, reason } = await closed;
+      this.#peer = undefined;
+      this.emit('close', code, reason);
+      if (reconnect === false || this.#isStopped()) break;
+      // Only a connection that stayed up for a while resets the backoff, so a server that
+      // accepts and immediately drops connections is not hammered.
+      if (Date.now() - openedAt >= resetAfterMs) backoffStep = 0;
+      await this.#backoff(backoffStep++, backoff);
+    }
+    this.#state = 'closed';
+  }
+
+  async #backoff(exponent: number, options: BackoffOptions): Promise<void> {
+    if (this.#stopped) return;
+    const delay = backoffDelay(exponent, options, this.#options.random);
+    this.#state = 'reconnecting';
+    this.emit('reconnecting', exponent + 1, delay);
+    await this.#sleep(delay);
+  }
+}

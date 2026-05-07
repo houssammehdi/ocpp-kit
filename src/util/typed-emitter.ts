@@ -16,6 +16,12 @@ type Listener = (...args: unknown[]) => void;
 export class TypedEventEmitter<Events extends EventMap<Events>> {
   readonly #emitter = new EventEmitter();
 
+  /**
+   * Type-level only (never set at runtime): exposes the event map so helpers can infer event
+   * signatures, e.g. `Parameters<NonNullable<T['eventTypes']>['close']>`.
+   */
+  declare readonly eventTypes?: Events;
+
   constructor() {
     // Load tests attach one listener per simulated charger; do not warn about "leaks".
     this.#emitter.setMaxListeners(0);

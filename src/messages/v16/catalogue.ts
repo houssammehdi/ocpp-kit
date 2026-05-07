@@ -101,12 +101,19 @@ export type CentralSystemResponse<A extends CentralSystemAction> = ResponseOf<
   A
 >;
 
-/**
- * Transaction-related messages. OCPP 1.6 requires a Charge Point to deliver these reliably and
- * in order, even across connection loss.
- */
-export const TRANSACTION_ACTIONS: ReadonlySet<ChargePointAction> = new Set([
+/** Transaction-related actions (see {@link isTransactionAction}). */
+export type TransactionAction = 'StartTransaction' | 'StopTransaction' | 'MeterValues';
+
+const TRANSACTION_ACTIONS: ReadonlySet<string> = new Set<TransactionAction>([
   'StartTransaction',
   'StopTransaction',
   'MeterValues',
 ]);
+
+/**
+ * Whether `action` is transaction-related. OCPP 1.6 requires a Charge Point to deliver these
+ * reliably and in order, even across connection loss.
+ */
+export function isTransactionAction(action: string): action is TransactionAction {
+  return TRANSACTION_ACTIONS.has(action);
+}
