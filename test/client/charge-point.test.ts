@@ -1,51 +1,13 @@
 import { afterEach, describe, expect, it, vi } from 'vitest';
 import {
-  CentralSystemToChargePoint,
   ChargePoint,
-  ChargePointToCentralSystem,
-  createDuplexPair,
-  HandlerRegistry,
   MemoryQueueStore,
   NotConnectedError,
   RpcError,
-  RpcPeer,
   type ChargePointOptions,
-  type ConnectRequest,
-  type Connector,
   type QueuedMessage,
 } from '../../src/index.js';
-import { nextEvent, NOW, until, type CsPeer } from '../helpers.js';
-
-/** An in-memory Central System that the client reaches through an injected connector. */
-class FakeCentralSystem {
-  readonly handlers = new HandlerRegistry<typeof ChargePointToCentralSystem>();
-  readonly peers: CsPeer[] = [];
-  readonly requests: ConnectRequest[] = [];
-  available = true;
-  received: string[] = [];
-
-  readonly connector: Connector = (request) => {
-    this.requests.push(request);
-    if (!this.available) return Promise.reject(new Error('connection refused'));
-    const [clientSide, serverSide] = createDuplexPair();
-    const peer: CsPeer = new RpcPeer(serverSide, {
-      inbound: ChargePointToCentralSystem,
-      outbound: CentralSystemToChargePoint,
-      handlers: this.handlers,
-    });
-    peer.on('callHandled', (event) => this.received.push(event.action));
-    this.peers.push(peer);
-    return Promise.resolve(clientSide);
-  };
-
-  get current(): CsPeer | undefined {
-    return this.peers.at(-1);
-  }
-
-  drop(): Promise<void> {
-    return this.current?.close(1006, 'network down') ?? Promise.resolve();
-  }
-}
+import { FakeCentralSystem, nextEvent, NOW, until } from '../helpers.js';
 
 const clients: ChargePoint[] = [];
 afterEach(async () => {

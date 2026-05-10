@@ -15,3 +15,4 @@ export * from './transport/websocket.js';
 export * from './server/index.js';
 export * from './client/index.js';
 export { TypedEventEmitter, type EventMap } from './util/typed-emitter.js';
+export * from './simulator/index.js';

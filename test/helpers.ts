@@ -1,5 +1,13 @@
 import { CentralSystemToChargePoint, ChargePointToCentralSystem } from '../src/messages/index.js';
-import { createDuplexPair, RpcPeer, type Duplex, type RpcPeerOptions } from '../src/rpc/index.js';
+import type { ConnectRequest, Connector } from '../src/client/index.js';
+import {
+  createDuplexPair,
+  HandlerRegistry,
+  RpcPeer,
+  type Duplex,
+  type JsonObject,
+  type RpcPeerOptions,
+} from '../src/rpc/index.js';
 
 export type CpPeer = RpcPeer<typeof CentralSystemToChargePoint, typeof ChargePointToCentralSystem>;
 export type CsPeer = RpcPeer<typeof ChargePointToCentralSystem, typeof CentralSystemToChargePoint>;
@@ -104,5 +112,59 @@ export async function until(
   while (!predicate()) {
     if (Date.now() > deadline) throw new Error('Condition not met in time');
     await new Promise((resolve) => setTimeout(resolve, stepMs));
+  }
+}
+
+/** A recorded inbound call on the fake Central System. */
+export interface RecordedCall {
+  readonly action: string;
+  readonly request: JsonObject;
+  readonly response?: JsonObject;
+}
+
+/** An in-memory Central System that clients reach through an injected {@link Connector}. */
+export class FakeCentralSystem {
+  readonly handlers = new HandlerRegistry<typeof ChargePointToCentralSystem>();
+  readonly peers: CsPeer[] = [];
+  readonly requests: ConnectRequest[] = [];
+  readonly calls: RecordedCall[] = [];
+  available = true;
+
+  readonly connector: Connector = (request) => {
+    this.requests.push(request);
+    if (!this.available) return Promise.reject(new Error('connection refused'));
+    const [clientSide, serverSide] = createDuplexPair();
+    const peer: CsPeer = new RpcPeer(serverSide, {
+      inbound: ChargePointToCentralSystem,
+      outbound: CentralSystemToChargePoint,
+      handlers: this.handlers,
+    });
+    peer.on('callHandled', (event) => {
+      this.calls.push({
+        action: event.action,
+        request: event.request,
+        ...(event.response ? { response: event.response } : {}),
+      });
+    });
+    this.peers.push(peer);
+    return Promise.resolve(clientSide);
+  };
+
+  /** Action names received so far, in order. */
+  get received(): string[] {
+    return this.calls.map((call) => call.action);
+  }
+
+  /** Requests received for one action. */
+  requestsOf(action: string): JsonObject[] {
+    return this.calls.filter((call) => call.action === action).map((call) => call.request);
+  }
+
+  get current(): CsPeer | undefined {
+    return this.peers.at(-1);
+  }
+
+  drop(): Promise<void> {
+    return this.current?.close(1006, 'network down') ?? Promise.resolve();
   }
 }
