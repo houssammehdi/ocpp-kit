@@ -264,6 +264,17 @@ describe('SimulatedCharger remote control', () => {
     expect(charger.profiles.profiles(1)[0]?.profile.transactionId).toBe(1);
   });
 
+  it('starts exactly one transaction when the cable is plugged in right after a remote start', async () => {
+    const { csms, charger } = await started();
+    await csms.current!.call('RemoteStartTransaction', { idTag: 'APP', connectorId: 1 });
+    charger.plugIn(1, EV);
+    await advance(1);
+    expect(csms.requestsOf('StartTransaction')).toEqual([
+      expect.objectContaining({ idTag: 'APP', connectorId: 1 }),
+    ]);
+    expect(charger.connectors[0]?.status).toBe('Charging');
+  });
+
   it('cancels a remote start after ConnectionTimeOut', async () => {
     const { csms, charger } = await started();
     await csms.current!.call('ChangeConfiguration', { key: 'ConnectionTimeOut', value: '15' });

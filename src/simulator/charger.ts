@@ -153,6 +153,15 @@ interface ActiveTransaction {
   pendingProfile: ChargingProfile | undefined;
 }
 
+/** A connector reserved for an id tag that has not started a transaction yet. */
+interface PendingAuthorization {
+  readonly idTag: string;
+  /** False while a remote start is still being authorized. */
+  readonly authorized: boolean;
+  readonly timer: NodeJS.Timeout | undefined;
+  readonly profile: ChargingProfile | undefined;
+}
+
 interface Connector {
   readonly id: number;
   readonly fsm: ConnectorStateMachine;
@@ -164,9 +173,7 @@ interface Connector {
   errorCode: ChargePointErrorCode;
   tx: ActiveTransaction | undefined;
   /** Authorized, waiting for the cable (ConnectionTimeOut), possibly with a remote TxProfile. */
-  pendingAuth:
-    | { idTag: string; timer: NodeJS.Timeout | undefined; profile?: ChargingProfile | undefined }
-    | undefined;
+  pendingAuth: PendingAuthorization | undefined;
   pendingUnavailable: boolean;
   autoTimer: NodeJS.Timeout | undefined;
   fullSince: number | undefined;
@@ -338,7 +345,7 @@ export class SimulatedCharger extends TypedEventEmitter<SimulatedChargerEvents> 
     c.ev = new ElectricVehicle(ev);
     c.fullSince = undefined;
     const pending = c.pendingAuth;
-    if (pending) {
+    if (pending?.authorized) {
       if (pending.timer) clearTimeout(pending.timer);
       c.pendingAuth = undefined;
       this.#startTransaction(c, pending.idTag, pending.profile);
@@ -582,7 +589,7 @@ export class SimulatedCharger extends TypedEventEmitter<SimulatedChargerEvents> 
       c.pendingAuth = undefined;
       c.fsm.tryApply('timeout');
     }, timeoutS * 1_000);
-    c.pendingAuth = { idTag, timer, profile };
+    c.pendingAuth = { idTag, authorized: true, timer, profile };
     c.fsm.tryApply('authorize');
     if (this.#autopilot) {
       this.#schedule(c, this.#autopilot.plugInDelayS, () => {
@@ -875,13 +882,21 @@ export class SimulatedCharger extends TypedEventEmitter<SimulatedChargerEvents> 
           (candidate.fsm.status === 'Available' || candidate.fsm.status === 'Preparing'),
       );
       if (!c || this.#rebooting) return { status: 'Rejected' };
-      // Reserve the connector synchronously so concurrent requests cannot both succeed.
-      c.pendingAuth = { idTag, timer: undefined };
+      // Reserve the connector synchronously so concurrent requests cannot both succeed; the
+      // transaction itself starts after the response has been sent.
+      const reservation: PendingAuthorization = {
+        idTag,
+        authorized: false,
+        timer: undefined,
+        profile: chargingProfile,
+      };
+      c.pendingAuth = reservation;
       this.#later(0, () => {
         void (async () => {
           const authorized =
             !this.configuration.getBoolean('AuthorizeRemoteTxRequests', false) ||
             (await this.#authorize(idTag));
+          if (c.pendingAuth !== reservation) return;
           c.pendingAuth = undefined;
           if (!authorized) return;
           if (c.plugged) this.#startTransaction(c, idTag, chargingProfile);
