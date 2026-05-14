@@ -33,7 +33,9 @@ export interface CentralSystemOptions {
   readonly pingIntervalMs?: number;
   /**
    * Answer every CALL other than BootNotification with `SecurityError` until the charge point
-   * has received an `Accepted` BootNotification response on this connection. Default: false.
+   * has received an `Accepted` BootNotification response. Registration is remembered per
+   * identity for the lifetime of this server, because OCPP 1.6 charge points do not re-send
+   * BootNotification after a mere reconnect. Default: false.
    */
   readonly requireAcceptedBoot?: boolean;
   /**
@@ -134,6 +136,8 @@ export class CentralSystem extends TypedEventEmitter<CentralSystemEvents> {
   #ownServer: Server | undefined;
   #pingTimer: NodeJS.Timeout | undefined;
   readonly #alive = new WeakSet<ChargePointConnection>();
+  /** Identities whose latest BootNotification was accepted. */
+  readonly #registered = new Set<string>();
   #closing = false;
 
   constructor(options: CentralSystemOptions = {}) {
@@ -186,8 +190,11 @@ export class CentralSystem extends TypedEventEmitter<CentralSystemEvents> {
       const response = await handler(payload, context);
       if (action === 'BootNotification') {
         connection.lastBootNotification = payload as RequestOf<Inbound, 'BootNotification'>;
-        connection.bootAccepted =
+        const accepted =
           (response as ResponseOf<Inbound, 'BootNotification'>).status === 'Accepted';
+        if (accepted) this.#registered.add(connection.identity);
+        else this.#registered.delete(connection.identity);
+        connection.bootAccepted = accepted;
       }
       return response;
     };
@@ -362,6 +369,7 @@ export class CentralSystem extends TypedEventEmitter<CentralSystemEvents> {
 
     const connection = new ChargePointConnection(ws, identity, request, {
       handlers: this.#handlers,
+      bootAccepted: this.#registered.has(identity),
       callTimeoutMs: this.#options.callTimeoutMs,
       validateInbound: this.#options.validateInbound,
       validateOutbound: this.#options.validateOutbound,

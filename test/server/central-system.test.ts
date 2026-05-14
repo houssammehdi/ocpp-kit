@@ -198,6 +198,12 @@ describe('CentralSystem security profile 1', () => {
     status = 'Accepted';
     await cp.call('BootNotification', { chargePointVendor: 'V', chargePointModel: 'M' });
     await expect(cp.call('Heartbeat', {})).resolves.toEqual({ currentTime: NOW });
+
+    // Registration survives a reconnect: charge points do not boot again after a network blip.
+    await cp.close();
+    const again = client(url, 'CP-1');
+    await again.connect();
+    await expect(again.call('Heartbeat', {})).resolves.toEqual({ currentTime: NOW });
   });
 });
 

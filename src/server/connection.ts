@@ -29,6 +29,8 @@ export interface ConnectionOptions {
     typeof ChargePointToCentralSystem,
     CentralSystemHandlerContext
   >;
+  /** Whether this identity was already registered (accepted boot) earlier. */
+  readonly bootAccepted: boolean;
   readonly callTimeoutMs: number;
   readonly validateInbound: boolean;
   readonly validateOutbound: boolean;
@@ -46,8 +48,8 @@ export class ChargePointConnection {
   readonly peer: CentralSystemPeer;
   /** The most recent BootNotification received on this connection. */
   lastBootNotification: BootNotificationRequest | undefined;
-  /** Whether a BootNotification on this connection was answered with `Accepted`. */
-  bootAccepted = false;
+  /** Whether the charge point's latest BootNotification was answered with `Accepted`. */
+  bootAccepted: boolean;
   /** Timestamp of the last frame received from the charge point. */
   lastSeen: Date;
 
@@ -65,6 +67,7 @@ export class ChargePointConnection {
     this.remoteAddress = request.socket.remoteAddress;
     this.connectedAt = new Date();
     this.lastSeen = this.connectedAt;
+    this.bootAccepted = options.bootAccepted;
     this.peer = new RpcPeer(webSocketDuplex(ws), {
       inbound: ChargePointToCentralSystem,
       outbound: CentralSystemToChargePoint,
