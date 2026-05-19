@@ -1,4 +1,5 @@
-import { request } from 'node:http';
+import { createServer, request } from 'node:http';
+import type { AddressInfo } from 'node:net';
 import { afterEach, describe, expect, it } from 'vitest';
 import { WebSocket } from 'ws';
 import {
@@ -118,6 +119,20 @@ describe('CentralSystem connections', () => {
     const other = rawSocket(`${url}/CP-2`, ['ocpp2.0.1']);
     const error = await new Promise<Error>((resolve) => other.once('error', resolve));
     expect(error.message).toMatch(/subprotocol/i);
+  });
+
+  it('attaches to an existing HTTP server, leaving other routes to it', async () => {
+    const server = createServer((_req, res) => res.end('health: ok'));
+    await new Promise<void>((resolve) => server.listen(0, '127.0.0.1', resolve));
+    cleanups.push(() => new Promise((resolve) => server.close(resolve)));
+    const cs = new CentralSystem({ basePath: '/ocpp' }).attach(server);
+    cleanups.push(() => cs.close({ timeoutMs: 200 }));
+    const { port } = server.address() as AddressInfo;
+    const cp = client(`ws://127.0.0.1:${port}/ocpp`, 'CP-A');
+    await cp.connect();
+    expect(cs.connections.has('CP-A')).toBe(true);
+    const body = await fetch(`http://127.0.0.1:${port}/health`).then((r) => r.text());
+    expect(body).toBe('health: ok');
   });
 
   it('answers plain HTTP requests with 426 Upgrade Required', async () => {

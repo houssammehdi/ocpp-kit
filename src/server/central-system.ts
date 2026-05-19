@@ -1,4 +1,5 @@
 import { createServer, type IncomingMessage, type Server } from 'node:http';
+import type { Server as HttpsServer } from 'node:https';
 import type { AddressInfo } from 'node:net';
 import type { Duplex as NodeDuplex } from 'node:stream';
 import { WebSocketServer, type WebSocket } from 'ws';
@@ -132,7 +133,6 @@ export class CentralSystem extends TypedEventEmitter<CentralSystemEvents> {
   readonly #handlers = new HandlerRegistry<Inbound, CentralSystemHandlerContext>();
   readonly #connections = new Map<string, ChargePointConnection>();
   readonly #wss: WebSocketServer;
-  readonly #servers = new Set<Server>();
   #ownServer: Server | undefined;
   #pingTimer: NodeJS.Timeout | undefined;
   readonly #alive = new WeakSet<ChargePointConnection>();
@@ -241,9 +241,11 @@ export class CentralSystem extends TypedEventEmitter<CentralSystemEvents> {
     return server.address() as AddressInfo;
   }
 
-  /** Attach to an existing HTTP(S) server, handling its WebSocket upgrade requests. */
-  attach(server: Server): this {
-    this.#servers.add(server);
+  /**
+   * Attach to an existing HTTP or HTTPS server, handling its WebSocket upgrade requests. Use an
+   * `https.Server` to terminate TLS yourself (e.g. for Security Profile 2).
+   */
+  attach(server: Server | HttpsServer): this {
     server.on('upgrade', (request: IncomingMessage, socket: NodeDuplex, head: Buffer) => {
       void this.#onUpgrade(request, socket, head);
     });
