@@ -22,7 +22,7 @@ import {
   type ConfigKeyDefinition,
 } from './configuration.js';
 import { ConnectorStateMachine, type ConnectorStatus } from './connector-state.js';
-import { ElectricVehicle, randomEvProfile, type EvProfile } from './ev.js';
+import { acceptedPowerW, ElectricVehicle, randomEvProfile, type EvProfile } from './ev.js';
 import { deriveSeed, Random } from './random.js';
 import {
   ChargingProfileManager,
@@ -779,19 +779,37 @@ export class SimulatedCharger extends TypedEventEmitter<SimulatedChargerEvents> 
     }
   }
 
+  /**
+   * Power offered to each active connector: the hardware limit, capped by Tx(Default)Profiles,
+   * with any ChargePointMaxProfile shared out by water-filling so that capacity one connector
+   * cannot use (profile limit or EV acceptance) goes to the others.
+   */
   #offeredPower(active: readonly Connector[], now: Date): Map<Connector, number> {
-    const station = this.profiles.stationLimitW(now, this.#spec);
-    const share = station === undefined ? Infinity : station / Math.max(1, active.length);
-    const result = new Map<Connector, number>();
-    for (const c of active) {
+    const caps = active.map((c) => {
       const limit = this.profiles.connectorLimitW(
         c.id,
         now,
         this.#transactionContext(c),
         this.#spec,
       );
-      result.set(c, Math.max(0, Math.min(this.#maxPowerW, share, limit ?? Infinity)));
-    }
+      return { c, cap: Math.max(0, Math.min(this.#maxPowerW, limit ?? Infinity)) };
+    });
+    const result = new Map<Connector, number>(caps.map(({ c, cap }) => [c, cap]));
+    const station = this.profiles.stationLimitW(now, this.#spec);
+    if (station === undefined) return result;
+    const demand = (c: Connector, cap: number): number =>
+      Math.min(cap, c.ev ? acceptedPowerW(c.ev.profile, c.ev.soc) : 0);
+    const byDemand = caps
+      .map(({ c, cap }) => ({ c, cap, demand: demand(c, cap) }))
+      .sort((a, b) => a.demand - b.demand);
+    let remaining = Math.max(0, station);
+    // Max-min fair allocation: serve the smallest demands first; whatever they leave unused is
+    // shared among the rest.
+    byDemand.forEach(({ c, cap, demand: wanted }, index) => {
+      const offered = Math.min(cap, remaining / (byDemand.length - index));
+      result.set(c, offered);
+      remaining -= Math.min(offered, wanted);
+    });
     return result;
   }
 

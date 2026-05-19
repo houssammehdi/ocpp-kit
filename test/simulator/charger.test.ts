@@ -539,6 +539,33 @@ describe('SimulatedCharger smart charging', () => {
     expect(charger.stats().powerW).toBe(12_000);
   });
 
+  it('gives capacity one connector cannot use to the others (max-min fairness)', async () => {
+    const { csms, charger } = await started();
+    await charging(charger, 1, { ...EV, maxPowerW: 22_000 });
+    await charging(charger, 2, { ...EV, maxPowerW: 7_400 });
+    const cs = csms.current!;
+    await cs.call('SetChargingProfile', {
+      connectorId: 0,
+      csChargingProfiles: {
+        chargingProfileId: 9,
+        stackLevel: 0,
+        chargingProfilePurpose: 'ChargePointMaxProfile',
+        chargingProfileKind: 'Absolute',
+        chargingSchedule: {
+          chargingRateUnit: 'W',
+          chargingSchedulePeriod: [{ startPeriod: 0, limit: 20_000 }],
+        },
+      },
+    });
+    await advance(1);
+    expect(charger.connectors.map((c) => c.powerW)).toEqual([12_600, 7_400]);
+    // Pausing connector 2 hands its share to connector 1.
+    await cs.call('SetChargingProfile', { connectorId: 2, csChargingProfiles: txDefault(0, 3) });
+    await advance(1);
+    expect(charger.connectors.map((c) => c.powerW)).toEqual([20_000, 0]);
+    expect(charger.connectors[1]?.status).toBe('SuspendedEVSE');
+  });
+
   it('rejects profiles for unknown connectors and TxProfiles without a transaction', async () => {
     const { csms } = await started();
     const cs = csms.current!;
