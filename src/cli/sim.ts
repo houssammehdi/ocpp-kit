@@ -1,7 +1,7 @@
 import { parseArgs } from 'node:util';
 import { Fleet, type FleetStats } from '../simulator/fleet.js';
 import { parseDuration, parseInteger, parseRangeSeconds, parseRate, parseUrl } from './args.js';
-import { formatClock, formatNumber } from './format.js';
+import { formatClock, formatNumber, untilInterrupted } from './format.js';
 
 export const SIM_USAGE = `Usage: ocpp-kit sim [options]
 
@@ -40,7 +40,10 @@ export function formatStats(stats: FleetStats, elapsedMs: number): string {
 }
 
 /** `ocpp-kit sim` entry point. */
-export async function runSim(argv: readonly string[]): Promise<void> {
+export async function runSim(
+  argv: readonly string[],
+  options: { signal?: AbortSignal } = {},
+): Promise<void> {
   const { values } = parseArgs({
     args: [...argv],
     options: {
@@ -103,15 +106,11 @@ export async function runSim(argv: readonly string[]): Promise<void> {
   );
   void fleet.start();
 
-  await new Promise<void>((resolve) => {
-    const timer = durationMs === undefined ? undefined : setTimeout(resolve, durationMs);
-    const finish = (): void => {
-      if (timer) clearTimeout(timer);
-      resolve();
-    };
-    process.once('SIGINT', finish);
-    process.once('SIGTERM', finish);
-  });
+  const stop = new AbortController();
+  options.signal?.addEventListener('abort', () => stop.abort(), { once: true });
+  const timer = durationMs === undefined ? undefined : setTimeout(() => stop.abort(), durationMs);
+  await untilInterrupted(stop.signal);
+  clearTimeout(timer);
   clearInterval(ticker);
   const final = fleet.stats();
   await fleet.stop();

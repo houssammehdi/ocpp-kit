@@ -56,3 +56,25 @@ export function renderTable<Row>(
 export function formatNumber(value: number, decimals = 1): string {
   return value.toFixed(decimals);
 }
+
+/**
+ * Resolve when the process receives SIGINT/SIGTERM or `signal` aborts, removing the listeners
+ * afterwards so repeated invocations (e.g. in tests) do not leak them.
+ */
+export function untilInterrupted(signal?: AbortSignal): Promise<void> {
+  return new Promise((resolve) => {
+    const finish = (): void => {
+      process.off('SIGINT', finish);
+      process.off('SIGTERM', finish);
+      signal?.removeEventListener('abort', finish);
+      resolve();
+    };
+    if (signal?.aborted) {
+      resolve();
+      return;
+    }
+    process.once('SIGINT', finish);
+    process.once('SIGTERM', finish);
+    signal?.addEventListener('abort', finish, { once: true });
+  });
+}

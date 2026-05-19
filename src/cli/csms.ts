@@ -2,7 +2,7 @@ import { createInterface } from 'node:readline';
 import { parseArgs } from 'node:util';
 import { parseDuration, parseInteger, UsageError } from './args.js';
 import { DemoCsms, type StationView } from './demo-csms.js';
-import { fit, formatNumber, renderTable, type Column } from './format.js';
+import { fit, formatNumber, renderTable, untilInterrupted, type Column } from './format.js';
 
 export const CSMS_USAGE = `Usage: ocpp-kit csms [options]
 
@@ -126,7 +126,10 @@ export async function executeCommand(csms: DemoCsms, line: string): Promise<Comm
 }
 
 /** `ocpp-kit csms` entry point. */
-export async function runCsms(argv: readonly string[]): Promise<void> {
+export async function runCsms(
+  argv: readonly string[],
+  options: { signal?: AbortSignal } = {},
+): Promise<void> {
   const { values } = parseArgs({
     args: [...argv],
     options: {
@@ -187,16 +190,15 @@ export async function runCsms(argv: readonly string[]): Promise<void> {
   }
 
   let rl: ReturnType<typeof createInterface> | undefined;
-  let stopping = false;
-  const stop = async (): Promise<void> => {
-    if (stopping) return;
-    stopping = true;
-    for (const timer of timers) clearInterval(timer);
-    rl?.close();
-    await csms.close();
-    if (table) process.stdout.write('\n');
-    console.log('CSMS stopped.');
-  };
+  let stopping: Promise<void> | undefined;
+  const stop = (): Promise<void> =>
+    (stopping ??= (async () => {
+      for (const timer of timers) clearInterval(timer);
+      rl?.close();
+      await csms.close();
+      if (table) process.stdout.write('\n');
+      console.log('CSMS stopped.');
+    })());
 
   if (table) {
     const draw = (): void => {
@@ -240,12 +242,9 @@ export async function runCsms(argv: readonly string[]): Promise<void> {
     rl.prompt();
   }
 
-  await new Promise<void>((resolve) => {
-    const finish = (): void => {
-      void stop().then(resolve);
-    };
-    process.once('SIGINT', finish);
-    process.once('SIGTERM', finish);
-    rl?.once('close', finish);
-  });
+  const interrupted = new AbortController();
+  options.signal?.addEventListener('abort', () => interrupted.abort(), { once: true });
+  rl?.once('close', () => interrupted.abort());
+  await untilInterrupted(interrupted.signal);
+  await stop();
 }
