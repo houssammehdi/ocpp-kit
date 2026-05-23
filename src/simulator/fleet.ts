@@ -1,4 +1,5 @@
 import { TypedEventEmitter } from '../util/typed-emitter.js';
+import { timerDelay } from '../util/timers.js';
 import { SimulatedCharger, type SimulatedChargerOptions } from './charger.js';
 import type { ConnectorStatus } from './connector-state.js';
 import { LatencyTracker, type LatencySummary } from './stats.js';
@@ -98,7 +99,7 @@ export class Fleet extends TypedEventEmitter<FleetEvents> {
             );
           });
         }
-        this.#ramp = setTimeout(launch, intervalMs);
+        this.#ramp = setTimeout(launch, timerDelay(intervalMs));
       };
       launch();
     });

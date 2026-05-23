@@ -20,6 +20,7 @@ import { validatePayload, type ActionName } from '../rpc/validation.js';
 import { basicAuthHeader } from '../server/auth.js';
 import { OCPP16_SUBPROTOCOL } from '../transport/websocket.js';
 import { TypedEventEmitter } from '../util/typed-emitter.js';
+import { timerDelay } from '../util/timers.js';
 import { backoffDelay, DEFAULT_BACKOFF, type BackoffOptions } from './backoff.js';
 import { webSocketConnector, type Connector } from './connector.js';
 import {
@@ -323,7 +324,7 @@ export class ChargePoint extends TypedEventEmitter<ChargePointEvents> {
         this.#wakers.delete(wake);
         resolve();
       };
-      const timer = setTimeout(wake, ms);
+      const timer = setTimeout(wake, timerDelay(ms));
       this.#wakers.add(wake);
     });
   }

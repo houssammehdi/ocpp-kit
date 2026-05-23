@@ -2,6 +2,7 @@ import { WebSocket } from 'ws';
 import type { Duplex } from '../rpc/duplex.js';
 import { OcppKitError } from '../rpc/errors.js';
 import { OCPP16_SUBPROTOCOL, webSocketDuplex } from '../transport/websocket.js';
+import { timerDelay } from '../util/timers.js';
 
 /** Parameters for opening a connection to a Central System. */
 export interface ConnectRequest {
@@ -36,7 +37,7 @@ export const webSocketConnector: Connector = (request) =>
   new Promise<Duplex>((resolve, reject) => {
     const ws = new WebSocket(request.url, [...request.protocols], {
       headers: { ...request.headers },
-      handshakeTimeout: request.handshakeTimeoutMs,
+      handshakeTimeout: timerDelay(request.handshakeTimeoutMs),
     });
     let settled = false;
     const fail = (error: HandshakeError): void => {

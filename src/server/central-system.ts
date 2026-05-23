@@ -10,6 +10,7 @@ import { HandlerRegistry, type CallOptions, type RequestHandler } from '../rpc/p
 import type { ActionName, RequestOf, ResponseOf } from '../rpc/validation.js';
 import { OCPP16_SUBPROTOCOL } from '../transport/websocket.js';
 import { TypedEventEmitter } from '../util/typed-emitter.js';
+import { timerDelay } from '../util/timers.js';
 import { parseBasicAuth, type Authenticator } from './auth.js';
 import { ChargePointConnection, type CentralSystemHandlerContext } from './connection.js';
 
@@ -267,7 +268,7 @@ export class CentralSystem extends TypedEventEmitter<CentralSystemEvents> {
     for (const connection of connections) void connection.close(code, reason);
     let timer: NodeJS.Timeout | undefined;
     const timedOut = new Promise<void>((resolve) => {
-      timer = setTimeout(resolve, timeoutMs);
+      timer = setTimeout(resolve, timerDelay(timeoutMs));
     });
     await Promise.race([allClosed, timedOut]);
     clearTimeout(timer);
@@ -405,7 +406,7 @@ export class CentralSystem extends TypedEventEmitter<CentralSystemEvents> {
         this.#alive.delete(connection);
         connection.ping();
       }
-    }, interval);
+    }, timerDelay(interval));
     this.#pingTimer.unref();
   }
 }

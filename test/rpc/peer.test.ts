@@ -302,6 +302,16 @@ describe('RpcPeer timeouts', () => {
     await expect(second).resolves.toEqual({ status: 'Accepted' });
   });
 
+  it('does not time out after 1 ms when the timeout exceeds the timer range', async () => {
+    vi.useFakeTimers();
+    const { cs, remote, next } = rawPair({ callTimeoutMs: 2 ** 31 });
+    const pending = cs.call('ClearCache', {});
+    const [, id] = await next();
+    await vi.advanceTimersByTimeAsync(1_000);
+    remote.send(JSON.stringify([3, id, { status: 'Accepted' }]));
+    await expect(pending).resolves.toEqual({ status: 'Accepted' });
+  });
+
   it('starts the timeout clock when the frame is sent, not when it is queued', async () => {
     vi.useFakeTimers();
     const { cs, remote, next } = rawPair({ callTimeoutMs: 1_000 });

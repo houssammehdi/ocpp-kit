@@ -119,6 +119,38 @@ describe('SimulatedCharger boot and heartbeat', () => {
     expect(charger.isRegistered).toBe(true);
   });
 
+  it('does not flood the CSMS when an interval exceeds the Node.js timer range', async () => {
+    // Regression: setInterval silently turns delays above 2^31-1 ms into 1 ms.
+    const { csms, charger } = setup();
+    csms.handlers.set('BootNotification', () => ({
+      status: 'Accepted',
+      currentTime: new Date().toISOString(),
+      interval: 3_000_000,
+    }));
+    await charger.start();
+    await advance(1);
+    expect(charger.configuration.get('HeartbeatInterval')).toBe('3000000');
+    expect(csms.requestsOf('Heartbeat')).toHaveLength(0);
+    await csms.current!.call('ChangeConfiguration', {
+      key: 'HeartbeatInterval',
+      value: '2592000',
+    });
+    await advance(1);
+    expect(csms.requestsOf('Heartbeat')).toHaveLength(0);
+  });
+
+  it('does not retry a Pending boot every millisecond when the interval is huge', async () => {
+    const { csms, charger } = setup();
+    csms.handlers.set('BootNotification', () => ({
+      status: 'Pending',
+      currentTime: new Date().toISOString(),
+      interval: 4_000_000,
+    }));
+    await charger.start();
+    await advance(1);
+    expect(csms.requestsOf('BootNotification')).toHaveLength(1);
+  });
+
   it('restarts the heartbeat when HeartbeatInterval changes', async () => {
     const { csms } = await started();
     await expect(

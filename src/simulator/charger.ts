@@ -16,6 +16,7 @@ import type {
 } from '../messages/index.js';
 import type { CompletedCallEvent } from '../rpc/peer.js';
 import { TypedEventEmitter } from '../util/typed-emitter.js';
+import { timerDelay } from '../util/timers.js';
 import {
   ConfigurationStore,
   defaultConfiguration,
@@ -313,9 +314,12 @@ export class SimulatedCharger extends TypedEventEmitter<SimulatedChargerEvents> 
   async start(): Promise<void> {
     if (!this.#stopped) return;
     this.#stopped = false;
-    this.#tick = setInterval(() => {
-      this.#onTick();
-    }, this.#tickS * 1_000);
+    this.#tick = setInterval(
+      () => {
+        this.#onTick();
+      },
+      timerDelay(this.#tickS * 1_000),
+    );
     await this.#client.connect();
   }
 
@@ -495,7 +499,7 @@ export class SimulatedCharger extends TypedEventEmitter<SimulatedChargerEvents> 
     const timer = setTimeout(() => {
       this.#timers.delete(timer);
       if (!this.#stopped) fn();
-    }, ms);
+    }, timerDelay(ms));
     this.#timers.add(timer);
   }
 
@@ -505,7 +509,7 @@ export class SimulatedCharger extends TypedEventEmitter<SimulatedChargerEvents> 
     c.autoTimer = setTimeout(() => {
       c.autoTimer = undefined;
       if (!this.#stopped && !this.#rebooting) fn();
-    }, delayMs);
+    }, timerDelay(delayMs));
   }
 
   #randomIdTag(): string {
@@ -547,9 +551,12 @@ export class SimulatedCharger extends TypedEventEmitter<SimulatedChargerEvents> 
     this.#heartbeat = undefined;
     const intervalS = this.configuration.getInteger('HeartbeatInterval', 300);
     if (intervalS <= 0 || this.#stopped) return;
-    this.#heartbeat = setInterval(() => {
-      if (this.#client.isConnected) void this.#call('Heartbeat', {});
-    }, intervalS * 1_000);
+    this.#heartbeat = setInterval(
+      () => {
+        if (this.#client.isConnected) void this.#call('Heartbeat', {});
+      },
+      timerDelay(intervalS * 1_000),
+    );
   }
 
   #sendAllStatuses(): void {
@@ -584,11 +591,14 @@ export class SimulatedCharger extends TypedEventEmitter<SimulatedChargerEvents> 
   /** Authorized but not plugged in yet: wait up to ConnectionTimeOut for the cable. */
   #awaitPlugIn(c: Connector, idTag: string, profile?: ChargingProfile): void {
     const timeoutS = this.configuration.getInteger('ConnectionTimeOut', 60);
-    const timer = setTimeout(() => {
-      if (c.pendingAuth?.idTag !== idTag) return;
-      c.pendingAuth = undefined;
-      c.fsm.tryApply('timeout');
-    }, timeoutS * 1_000);
+    const timer = setTimeout(
+      () => {
+        if (c.pendingAuth?.idTag !== idTag) return;
+        c.pendingAuth = undefined;
+        c.fsm.tryApply('timeout');
+      },
+      timerDelay(timeoutS * 1_000),
+    );
     c.pendingAuth = { idTag, authorized: true, timer, profile };
     c.fsm.tryApply('authorize');
     if (this.#autopilot) {

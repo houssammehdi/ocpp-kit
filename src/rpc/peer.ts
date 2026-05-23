@@ -1,5 +1,6 @@
 import { randomUUID } from 'node:crypto';
 import { TypedEventEmitter } from '../util/typed-emitter.js';
+import { timerDelay } from '../util/timers.js';
 import type { Duplex } from './duplex.js';
 import { CallAbortedError, CallTimeoutError, ConnectionClosedError, RpcError } from './errors.js';
 import {
@@ -319,7 +320,7 @@ export class RpcPeer<
       };
       const timer = setTimeout(() => {
         this.#settle(new CallTimeoutError(next.action, messageId, next.timeoutMs));
-      }, next.timeoutMs);
+      }, timerDelay(next.timeoutMs));
       this.#inFlight = { call: next, messageId, timer, sentAt: performance.now() };
       if (!this.#send(frame)) {
         // The channel died underneath us; its close event will fail the rest of the queue.
