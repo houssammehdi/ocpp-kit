@@ -204,6 +204,14 @@ describe('SimulatedCharger sessions', () => {
     expect(charger.stats()).toMatchObject({ sessionsStarted: 1, sessionsCompleted: 1 });
   });
 
+  it('compares id tags case-insensitively (IdToken is a CiString20)', async () => {
+    const { csms, charger } = await started();
+    await charging(charger);
+    expect(await charger.swipe(1, 'tag-1')).toBe(true);
+    await advance(0);
+    expect(csms.requestsOf('StopTransaction')[0]).toMatchObject({ reason: 'Local' });
+  });
+
   it('does not start when authorization is refused', async () => {
     const { csms, charger } = await started();
     charger.plugIn(1, EV);

@@ -3,9 +3,27 @@ import { Type, type TLiteral, type TString, type TUnion, type TInteger } from '@
 /** Options shared by every PDU object: OCPP 1.6 JSON schemas forbid undeclared properties. */
 export const strict = { additionalProperties: false } as const;
 
-/** Case-insensitive string with a maximum length (`CiStringNType` in the specification). */
+/**
+ * Case-insensitive string with a maximum length (`CiStringNType` in the specification).
+ *
+ * The schema only checks the length; compare values with {@link ciEquals}, because OCPP 1.6
+ * treats `"04a2b3c4"` and `"04A2B3C4"` as the same identifier.
+ */
 export function CiString(maxLength: number): TString {
   return Type.String({ maxLength });
+}
+
+/**
+ * Canonical form of a CiString for use as a map key: two CiStrings are equal exactly when their
+ * canonical forms are equal.
+ */
+export function ciKey(value: string): string {
+  return value.toLowerCase();
+}
+
+/** Compare two CiString values (id tags, configuration keys, ...) the way OCPP 1.6 does. */
+export function ciEquals(a: string, b: string): boolean {
+  return a === b || ciKey(a) === ciKey(b);
 }
 
 type LiteralTuple<T extends readonly string[]> = { -readonly [K in keyof T]: TLiteral<T[K]> };

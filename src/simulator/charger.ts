@@ -14,6 +14,7 @@ import type {
   SampledValue,
   StopReason,
 } from '../messages/index.js';
+import { ciEquals } from '../messages/v16/primitives.js';
 import type { CompletedCallEvent } from '../rpc/peer.js';
 import { TypedEventEmitter } from '../util/typed-emitter.js';
 import { timerDelay } from '../util/timers.js';
@@ -384,7 +385,7 @@ export class SimulatedCharger extends TypedEventEmitter<SimulatedChargerEvents> 
   async swipe(connectorId: number, idTag: string): Promise<boolean> {
     const c = this.#connector(connectorId);
     if (c.tx) {
-      if (c.tx.idTag !== idTag || c.tx.stopping) return false;
+      if (!ciEquals(c.tx.idTag, idTag) || c.tx.stopping) return false;
       await this.#stopTransaction(c, 'Local');
       return true;
     }
