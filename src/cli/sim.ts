@@ -94,14 +94,20 @@ export async function runSim(
   const durationMs = values.duration === undefined ? undefined : parseDuration(values.duration);
 
   const startedAt = Date.now();
-  const tty = process.stdout.isTTY;
+  // With --json, stdout carries only the final JSON document so it can be piped into other
+  // tools; progress goes to stderr instead.
+  const progress = values.json ? process.stderr : process.stdout;
+  const tty = progress.isTTY;
+  const info = (line: string): void => {
+    progress.write(`${line}\n`);
+  };
   const print = (): void => {
     const line = formatStats(fleet.stats(), Date.now() - startedAt);
-    if (tty) process.stdout.write(`\r\x1b[2K${line}`);
-    else console.log(line);
+    if (tty) progress.write(`\r\x1b[2K${line}`);
+    else info(line);
   };
   const ticker = setInterval(print, tty ? 1_000 : 5_000);
-  console.log(
+  info(
     `Simulating ${fleet.chargers.length} charge point(s) against ${values.url} (Ctrl-C to stop)`,
   );
   void fleet.start();
@@ -114,7 +120,7 @@ export async function runSim(
   clearInterval(ticker);
   const final = fleet.stats();
   await fleet.stop();
-  if (tty) process.stdout.write('\n');
-  if (values.json) console.log(JSON.stringify(final, null, 2));
-  else console.log(`Final: ${formatStats(final, Date.now() - startedAt)}`);
+  if (tty) progress.write('\n');
+  if (values.json) process.stdout.write(`${JSON.stringify(final, null, 2)}\n`);
+  else info(`Final: ${formatStats(final, Date.now() - startedAt)}`);
 }

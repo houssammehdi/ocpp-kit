@@ -1,5 +1,6 @@
 import { afterEach, describe, expect, it, vi } from 'vitest';
 import { CSMS_USAGE, runCsms } from '../../src/cli/csms.js';
+import { DemoCsms } from '../../src/cli/demo-csms.js';
 import { runSim, SIM_USAGE } from '../../src/cli/sim.js';
 import type { FleetStats } from '../../src/index.js';
 import { until } from '../helpers.js';
@@ -32,6 +33,42 @@ describe('CLI commands', () => {
     await expect(runCsms(['--bogus'])).rejects.toThrow(/Unknown option/);
   });
 
+  it('keeps stdout machine-readable with --json', async () => {
+    // Regression: the banner and progress lines used to go to stdout as well.
+    const csms = new DemoCsms();
+    const { port } = await csms.listen(0, '127.0.0.1');
+    const stdout: string[] = [];
+    const stderr: string[] = [];
+    const capture =
+      (sink: string[]) =>
+      (chunk: string | Uint8Array): boolean => {
+        sink.push(String(chunk));
+        return true;
+      };
+    vi.spyOn(process.stdout, 'write').mockImplementation(capture(stdout));
+    vi.spyOn(process.stderr, 'write').mockImplementation(capture(stderr));
+    try {
+      await runSim([
+        '--url',
+        `ws://127.0.0.1:${port}`,
+        '-n',
+        '2',
+        '--ramp',
+        '100/s',
+        '--no-autopilot',
+        '--duration',
+        '500ms',
+        '--json',
+      ]);
+    } finally {
+      vi.restoreAllMocks();
+      await csms.close();
+    }
+    const stats = JSON.parse(stdout.join('')) as FleetStats;
+    expect(stats).toMatchObject({ chargers: 2, started: 2 });
+    expect(stderr.join('')).toContain('Simulating 2 charge point(s)');
+  });
+
   it('runs the demo CSMS and a simulated fleet against it', async () => {
     const lines = captureConsole();
     const controller = new AbortController();
@@ -44,6 +81,12 @@ describe('CLI commands', () => {
     )?.[1];
     expect(port).toBeDefined();
 
+    const stdout: string[] = [];
+    vi.spyOn(process.stdout, 'write').mockImplementation((chunk: string | Uint8Array) => {
+      stdout.push(String(chunk));
+      return true;
+    });
+    vi.spyOn(process.stderr, 'write').mockImplementation(() => true);
     await runSim([
       '--url',
       `ws://127.0.0.1:${port}`,
@@ -61,8 +104,7 @@ describe('CLI commands', () => {
       '1500ms',
       '--json',
     ]);
-    const json = lines.find((line) => line.startsWith('{'));
-    const stats = JSON.parse(json ?? '{}') as FleetStats;
+    const stats = JSON.parse(stdout.join('')) as FleetStats;
     expect(stats).toMatchObject({ chargers: 3, started: 3, registered: 3, callErrors: 0 });
     // Remote starts were accepted; the simulated drivers are now walking up to plug in.
     expect(lines.some((line) => /auto-start: \d session\(s\) requested/.test(line))).toBe(true);
