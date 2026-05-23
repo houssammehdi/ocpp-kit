@@ -328,7 +328,7 @@ export class CentralSystem extends TypedEventEmitter<CentralSystemEvents> {
     if (authenticate) {
       const credentials = parseBasicAuth(request.headers.authorization);
       const password = credentials?.username === identity ? credentials.password : undefined;
-      let allowed = false;
+      let allowed: boolean;
       try {
         allowed = await authenticate({ identity, password, request });
       } catch {
