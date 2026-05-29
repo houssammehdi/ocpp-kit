@@ -26,7 +26,10 @@ export interface TransactionContext {
 interface Installed {
   readonly connectorId: number;
   readonly profile: ChargingProfile;
-  /** Resolved schedule start for Absolute profiles received without startSchedule. */
+  /**
+   * When the profile was installed: the schedule start of an Absolute profile without
+   * startSchedule that is evaluated outside a transaction (e.g. a ChargePointMaxProfile).
+   */
   readonly receivedAt: Date;
 }
 
@@ -66,7 +69,11 @@ function scheduleStart(
   const { startSchedule } = profile.chargingSchedule;
   switch (profile.chargingProfileKind) {
     case 'Absolute':
-      return startSchedule ? new Date(startSchedule) : entry.receivedAt;
+      // OCPP 1.6 ChargingSchedule.startSchedule: "If absent the schedule will be relative to
+      // start of charging." Without a transaction there is no such start, so fall back to the
+      // moment the profile was installed.
+      if (startSchedule) return new Date(startSchedule);
+      return tx?.startedAt ?? entry.receivedAt;
     case 'Relative':
       return tx?.startedAt ?? at;
     case 'Recurring': {

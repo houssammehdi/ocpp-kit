@@ -150,6 +150,24 @@ describe('ChargingProfileManager stacking and schedules', () => {
     expect(m.connectorLimitW(1, at(3_660), undefined, spec)).toBe(0);
   });
 
+  it('runs an absolute schedule without startSchedule from the start of charging', () => {
+    // Regression: the schedule used to start when the profile was received.
+    const m = manager();
+    const p = profile({
+      chargingProfileKind: 'Absolute',
+      limits: [
+        [0, 16],
+        [600, 8],
+      ],
+    });
+    m.set(1, p, undefined, T0);
+    const lateTx = { transactionId: 43, startedAt: at(300) };
+    expect(m.connectorLimitW(1, at(700), lateTx, spec)).toBe(16 * 690);
+    expect(m.connectorLimitW(1, at(900), lateTx, spec)).toBe(8 * 690);
+    // Outside a transaction the moment of installation is the only reference point.
+    expect(m.connectorLimitW(1, at(700), undefined, spec)).toBe(8 * 690);
+  });
+
   it('evaluates daily recurring schedules', () => {
     const m = manager();
     const p = profile({
