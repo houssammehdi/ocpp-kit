@@ -561,13 +561,40 @@ export class SimulatedCharger extends TypedEventEmitter<SimulatedChargerEvents> 
   }
 
   #sendAllStatuses(): void {
+    this.#sendStationStatus();
+    for (const c of this.#connectors) void this.#sendStatus(c);
+  }
+
+  #sendStationStatus(): void {
     void this.#call('StatusNotification', {
       connectorId: 0,
       errorCode: 'NoError',
       status: this.#stationAvailable ? 'Available' : 'Unavailable',
       timestamp: new Date().toISOString(),
     });
-    for (const c of this.#connectors) void this.#sendStatus(c);
+  }
+
+  /** MeterValues for connector 0: the charge point's main meter, i.e. all connectors together. */
+  #sendStationMeterValues(context: ReadingContext): void {
+    const energyWh = this.#connectors.reduce((sum, c) => sum + c.energyWh, 0);
+    const powerW = this.#connectors.reduce((sum, c) => sum + c.powerW, 0);
+    void this.#call('MeterValues', {
+      connectorId: 0,
+      meterValue: [
+        {
+          timestamp: new Date().toISOString(),
+          sampledValue: [
+            {
+              value: String(Math.round(energyWh)),
+              context,
+              measurand: ENERGY_REGISTER,
+              unit: 'Wh',
+            },
+            { value: round(powerW, 1), context, measurand: 'Power.Active.Import', unit: 'W' },
+          ],
+        },
+      ],
+    });
   }
 
   async #sendStatus(c: Connector): Promise<void> {
@@ -1003,7 +1030,13 @@ export class SimulatedCharger extends TypedEventEmitter<SimulatedChargerEvents> 
 
     on('TriggerMessage', ({ requestedMessage, connectorId }) => {
       if (connectorId !== undefined && connectorId > count) return { status: 'Rejected' };
-      const targets = connectorId === undefined ? this.#connectors : [this.#connector(connectorId)];
+      // Connector 0 addresses the charge point itself (its status, its main meter).
+      const targets =
+        connectorId === undefined
+          ? this.#connectors
+          : connectorId === 0
+            ? []
+            : [this.#connector(connectorId)];
       switch (requestedMessage) {
         case 'BootNotification':
           this.#later(0, () => void this.#boot());
@@ -1014,11 +1047,13 @@ export class SimulatedCharger extends TypedEventEmitter<SimulatedChargerEvents> 
         case 'StatusNotification':
           this.#later(0, () => {
             if (connectorId === undefined) this.#sendAllStatuses();
+            else if (connectorId === 0) this.#sendStationStatus();
             else for (const c of targets) void this.#sendStatus(c);
           });
           return { status: 'Accepted' };
         case 'MeterValues':
           this.#later(0, () => {
+            if (connectorId === 0) this.#sendStationMeterValues('Trigger');
             for (const c of targets) this.#sendMeterValues(c, 'Trigger');
           });
           return { status: 'Accepted' };

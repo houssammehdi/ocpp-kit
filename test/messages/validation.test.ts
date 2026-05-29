@@ -8,6 +8,7 @@ import {
   SetChargingProfileRequest,
   StartTransactionRequest,
   StatusNotificationRequest,
+  TriggerMessageRequest,
 } from '../../src/messages/index.js';
 import { collectIssues, validatePayload, type ActionSchema } from '../../src/rpc/index.js';
 
@@ -135,6 +136,19 @@ describe('payload validation', () => {
     for (const timestamp of ['2026-03-01T10:00:00', '2026-13-01T10:00:00Z', '2026-03-01 10:00Z']) {
       expect(validatePayload(StartTransactionRequest, { ...base, timestamp })).toBeDefined();
     }
+  });
+
+  it('accepts TriggerMessage for connector 0, as the official schema and the spec prose do', () => {
+    expect(
+      validatePayload(TriggerMessageRequest, {
+        requestedMessage: 'StatusNotification',
+        connectorId: 0,
+      }),
+    ).toBeUndefined();
+    expect(
+      validatePayload(TriggerMessageRequest, { requestedMessage: 'MeterValues', connectorId: -1 })
+        ?.code,
+    ).toBe('PropertyConstraintViolation');
   });
 
   it('caps the number of reported issues', () => {

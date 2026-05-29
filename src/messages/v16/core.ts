@@ -250,8 +250,13 @@ export const MessageTrigger = StringEnum([
 ]);
 export type MessageTrigger = Static<typeof MessageTrigger>;
 
+/**
+ * TriggerMessage.req. The specification's field table says `connectorId > 0`, but its prose
+ * (a StatusNotification trigger for connector 0 asks for the status of the charge point itself)
+ * and the official JSON schema allow 0, so 0 is accepted here.
+ */
 export const TriggerMessageRequest = Type.Object(
-  { requestedMessage: MessageTrigger, connectorId: Type.Optional(ConnectorId) },
+  { requestedMessage: MessageTrigger, connectorId: Type.Optional(ConnectorIdOrStation) },
   strict,
 );
 export type TriggerMessageRequest = Static<typeof TriggerMessageRequest>;

@@ -4,6 +4,7 @@ import {
   SimulatedCharger,
   type ChargingProfile,
   type EvProfile,
+  type MeterValue,
   type SimulatedChargerOptions,
 } from '../../src/index.js';
 import { FakeCentralSystem } from '../helpers.js';
@@ -487,6 +488,35 @@ describe('SimulatedCharger remote control', () => {
         { sampledValue: expect.arrayContaining([expect.objectContaining({ context: 'Trigger' })]) },
       ],
     });
+  });
+
+  it('answers TriggerMessage for connector 0 with the charge point status and main meter', async () => {
+    // Regression: connectorId 0 used to fail schema validation with a CALLERROR.
+    const { csms, charger } = await started();
+    await charging(charger);
+    await advance(60);
+    const cs = csms.current!;
+    const before = csms.calls.length;
+    await expect(
+      cs.call('TriggerMessage', { requestedMessage: 'StatusNotification', connectorId: 0 }),
+    ).resolves.toEqual({ status: 'Accepted' });
+    await expect(
+      cs.call('TriggerMessage', { requestedMessage: 'MeterValues', connectorId: 0 }),
+    ).resolves.toEqual({ status: 'Accepted' });
+    await advance(0);
+    const triggered = csms.calls.slice(before);
+    expect(triggered.map((c) => [c.action, c.request.connectorId])).toEqual([
+      ['StatusNotification', 0],
+      ['MeterValues', 0],
+    ]);
+    expect(triggered[0]?.request).toMatchObject({ status: 'Available' });
+    const [meterValue] = triggered[1]?.request.meterValue as MeterValue[];
+    const register = meterValue?.sampledValue.find(
+      (v) => v.measurand === 'Energy.Active.Import.Register',
+    );
+    expect(register).toMatchObject({ context: 'Trigger', unit: 'Wh' });
+    expect(Number(register?.value)).toBeGreaterThan(0);
+    expect(Number(register?.value)).toBe(Math.round(charger.stats().energyWh));
   });
 
   it('serves configuration, cache and data transfer requests', async () => {
