@@ -108,6 +108,10 @@ function fail(
  * | more elements than the message type allows                | `FormationViolation` |
  * | unknown message type id                                   | `ProtocolError`      |
  * | fewer elements than the message type requires             | `ProtocolError`      |
+ *
+ * {@link RpcPeer} answers a failed CALL with a CALLERROR carrying this code when the message id
+ * could be recovered. Frames of an unknown message type are only reported, never answered:
+ * OCPP-J 1.6 section 4.1.3 says to ignore them.
  */
 export function parseFrame(raw: string): ParseResult {
   let decoded: unknown;

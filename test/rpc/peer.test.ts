@@ -206,6 +206,47 @@ describe('RpcPeer framing faults', () => {
     await expect(pending).rejects.toMatchObject({ code: 'ProtocolError' });
   });
 
+  it('ignores frames with an unknown message type even if their id matches our call', async () => {
+    // Regression: such a frame used to fail the outstanding call with ProtocolError.
+    const { cs, remote, next } = rawPair();
+    const bad = vi.fn();
+    cs.on('badMessage', bad);
+    const pending = cs.call('ClearCache', {});
+    const [, id] = await next();
+    remote.send(JSON.stringify([7, id, { status: 'Accepted' }]));
+    await flush();
+    expect(bad).toHaveBeenCalledOnce();
+    expect(cs.hasCallInFlight).toBe(true);
+    remote.send(JSON.stringify([3, id, { status: 'Accepted' }]));
+    await expect(pending).resolves.toEqual({ status: 'Accepted' });
+  });
+
+  it('answers a CALL that reuses the id of one still being handled with a CALLERROR', async () => {
+    const { cs, remote, next } = rawPair();
+    let release!: () => void;
+    cs.handle('Heartbeat', async () => {
+      await new Promise<void>((resolve) => (release = resolve));
+      return { currentTime: NOW };
+    });
+    remote.send('[2,"dup","Heartbeat",{}]');
+    await flush();
+    remote.send('[2,"dup","Heartbeat",{}]');
+    expect(await next()).toEqual([
+      4,
+      'dup',
+      'GenericError',
+      'A CALL with message id dup is already being handled',
+      {},
+    ]);
+    release();
+    expect(await next()).toEqual([3, 'dup', { currentTime: NOW }]);
+    // Once answered, the id may be used again.
+    remote.send('[2,"dup","Heartbeat",{}]');
+    await flush();
+    release();
+    expect(await next()).toEqual([3, 'dup', { currentTime: NOW }]);
+  });
+
   it('reports responses that match no outstanding call', async () => {
     const { cs, remote } = rawPair();
     const unmatched = vi.fn();
@@ -376,6 +417,12 @@ describe('RpcPeer cancellation and shutdown', () => {
     const { cp } = peerPair();
     // @ts-expect-error -- not a charge point initiated action
     await expect(cp.call('Reset', { type: 'Soft' })).rejects.toMatchObject({
+      code: 'NotImplemented',
+    });
+    // Regression: prototype keys used to be mistaken for actions and threw synchronously.
+    const untyped = cp as unknown as { call(action: string, payload: object): Promise<unknown> };
+    await expect(untyped.call('toString', {})).rejects.toMatchObject({ code: 'NotImplemented' });
+    await expect(untyped.call('constructor', {})).rejects.toMatchObject({
       code: 'NotImplemented',
     });
   });

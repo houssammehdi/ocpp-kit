@@ -198,6 +198,8 @@ export class RpcPeer<
   #closed = false;
   #closeInfo: { code: number; reason: string } | undefined;
   readonly #closeWaiters: (() => void)[] = [];
+  /** Ids of inbound CALLs whose response has not been sent yet. */
+  readonly #handling = new Set<string>();
 
   constructor(duplex: Duplex, options: RpcPeerOptions<In, Out, C>) {
     super();
@@ -252,7 +254,7 @@ export class RpcPeer<
     payload: RequestOf<Out, A>,
     options: CallOptions = {},
   ): Promise<ResponseOf<Out, A>> {
-    const schema = this.#outbound[action];
+    const schema = Object.hasOwn(this.#outbound, action) ? this.#outbound[action] : undefined;
     if (!schema) {
       return Promise.reject(new RpcError('NotImplemented', `Unknown outbound action ${action}`));
     }
@@ -381,10 +383,15 @@ export class RpcPeer<
     const result = parseFrame(raw);
     if (!result.ok) {
       this.emit('badMessage', raw, result.error);
-      if (result.messageId === undefined) return;
-      if (result.messageType === MessageType.Call) {
-        this.#send(callErrorFrame(result.messageId, result.error));
-      } else if (this.#inFlight?.messageId === result.messageId) {
+      const { messageId, messageType } = result;
+      if (messageId === undefined || messageType === undefined) {
+        // No usable id, or a message type OCPP-J does not define: the specification says to
+        // ignore such messages, and a CALLERROR could not be correlated anyway.
+        return;
+      }
+      if (messageType === MessageType.Call) {
+        this.#send(callErrorFrame(messageId, result.error));
+      } else if (this.#inFlight?.messageId === messageId) {
         // A malformed answer to our call: fail it now instead of waiting for the timeout.
         this.#settle(result.error);
       }
@@ -429,9 +436,25 @@ export class RpcPeer<
   async #dispatch(frame: CallFrame): Promise<void> {
     const { messageId, action, payload } = frame;
     const startedAt = performance.now();
+    if (this.#handling.has(messageId)) {
+      // OCPP-J 4.2.3 names "an existing call with the same unique identifier is being handled
+      // already" as a CALLERROR situation. The original CALL is still answered normally.
+      this.#send(
+        callErrorFrame(
+          messageId,
+          new RpcError(
+            'GenericError',
+            `A CALL with message id ${messageId} is already being handled`,
+          ),
+        ),
+      );
+      return;
+    }
+    this.#handling.add(messageId);
     const finish = (
       outcome: { response: JsonObject } | { error: RpcError; cause?: unknown },
     ): void => {
+      this.#handling.delete(messageId);
       if ('response' in outcome) {
         this.#send({ type: MessageType.CallResult, messageId, payload: outcome.response });
       } else {
@@ -500,6 +523,7 @@ export class RpcPeer<
     if (this.#closed) return;
     this.#closed = true;
     this.#closeInfo = { code, reason };
+    this.#handling.clear();
     const error = (): ConnectionClosedError => new ConnectionClosedError(code, reason);
     if (this.#inFlight) this.#settle(error());
     for (const pending of this.#queue.splice(0)) {
