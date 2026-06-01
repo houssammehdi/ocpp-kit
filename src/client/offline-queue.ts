@@ -109,7 +109,11 @@ export class OfflineQueue {
     if (this.#loaded) return;
     const loaded = await this.#store.load();
     this.#messages = [...loaded, ...this.#messages].sort((a, b) => a.seq - b.seq);
-    this.#nextSeq = Math.max(this.#nextSeq, ...this.#messages.map((m) => m.seq + 1));
+    // A loop rather than Math.max(...seqs): spreading a few hundred thousand arguments throws
+    // a RangeError, which would make a large persisted queue impossible to restore.
+    for (const message of this.#messages) {
+      if (message.seq >= this.#nextSeq) this.#nextSeq = message.seq + 1;
+    }
     this.#loaded = true;
   }
 

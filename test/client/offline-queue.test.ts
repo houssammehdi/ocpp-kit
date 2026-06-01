@@ -74,6 +74,25 @@ describe('OfflineQueue', () => {
     expect(message.seq).toBe(4);
   });
 
+  it('restores very large persisted queues', async () => {
+    // Regression: Math.max(...seqs) threw a RangeError for a few hundred thousand messages.
+    const store = new MemoryQueueStore();
+    const count = 250_000;
+    await store.save(
+      Array.from({ length: count }, (_, i) => ({
+        seq: i + 1,
+        action: 'MeterValues' as const,
+        payload: {},
+        enqueuedAt: 'x',
+      })),
+    );
+    const queue = new OfflineQueue(store, count + 1);
+    await queue.init();
+    expect(queue.size).toBe(count);
+    const { message } = await queue.push('StopTransaction', {});
+    expect(message.seq).toBe(count + 1);
+  });
+
   it('treats a missing file as empty and rejects corrupt files', async () => {
     const dir = await mkdtemp(join(tmpdir(), 'ocpp-kit-'));
     dirs.push(dir);
