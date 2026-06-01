@@ -1,5 +1,6 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import {
+  MemoryQueueStore,
   RpcError,
   SimulatedCharger,
   type ChargingProfile,
@@ -277,6 +278,43 @@ describe('SimulatedCharger sessions', () => {
     const tail = csms.received.filter((a) => a === 'MeterValues' || a === 'StopTransaction');
     expect(tail.at(-1)).toBe('StopTransaction');
     expect(tail.filter((a) => a === 'MeterValues').length).toBeGreaterThanOrEqual(2);
+  });
+});
+
+describe('SimulatedCharger boot sequence after a power cut', () => {
+  it('replays cached transaction messages only once the new boot is accepted', async () => {
+    const store = new MemoryQueueStore();
+    const first = setup({ queueStore: store });
+    await first.charger.start();
+    await advance(0);
+    const transactionId = await charging(first.charger);
+    first.csms.available = false;
+    await first.csms.drop();
+    const stopping = first.charger.stopTransaction(1);
+    await advance(1);
+    expect(await store.load()).toEqual([expect.objectContaining({ action: 'StopTransaction' })]);
+    await first.charger.stop(); // power cut: the message stays in the store
+    await stopping;
+
+    const csms = new FakeCentralSystem();
+    const second = setup({ queueStore: store }, csms);
+    let status: 'Pending' | 'Accepted' = 'Pending';
+    csms.handlers.set('BootNotification', () => ({
+      status,
+      currentTime: new Date().toISOString(),
+      interval: 30,
+    }));
+    await second.charger.start();
+    await advance(1);
+    expect(csms.received).toEqual(['BootNotification']);
+    status = 'Accepted';
+    await advance(30);
+    expect(csms.received.slice(0, 3)).toEqual([
+      'BootNotification',
+      'BootNotification',
+      'StopTransaction',
+    ]);
+    expect(csms.requestsOf('StopTransaction')[0]).toMatchObject({ transactionId });
   });
 });
 

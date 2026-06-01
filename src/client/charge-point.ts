@@ -5,6 +5,7 @@ import {
   type ChargePointAction,
   type ChargePointRequest,
   type ChargePointResponse,
+  type RegistrationStatus,
 } from '../messages/index.js';
 import type { Duplex } from '../rpc/duplex.js';
 import { CallTimeoutError, ConnectionClosedError, OcppKitError, RpcError } from '../rpc/errors.js';
@@ -67,7 +68,7 @@ export interface ChargePointOptions {
    * Offline queue for StartTransaction, StopTransaction and MeterValues, or `false` to send them
    * like any other message. Default: in-memory store, 10 000 messages.
    */
-  readonly offlineQueue?: { readonly store?: OfflineQueueStore; readonly maxSize?: number } | false;
+  readonly offlineQueue?: OfflineQueueOptions | false;
   /**
    * Attempts per transaction message when the Central System answers with CALLERROR or does not
    * answer in time (`TransactionMessageAttempts`). Connection loss does not count. Default: 3.
@@ -84,6 +85,23 @@ export interface ChargePointOptions {
   readonly connector?: Connector;
   readonly validateInbound?: boolean;
   readonly validateOutbound?: boolean;
+}
+
+/** Options of the {@link ChargePoint} offline queue. */
+export interface OfflineQueueOptions {
+  /** Persistence backend. Default: {@link MemoryQueueStore}. */
+  readonly store?: OfflineQueueStore;
+  /** Maximum number of queued messages. Default: 10 000. */
+  readonly maxSize?: number;
+  /**
+   * Hold queued messages until a BootNotification sent through this client has been answered
+   * with `Accepted`. OCPP 1.6 section 4.2 forbids any other request between a (re)boot and the
+   * BootNotification response, "This includes cached messages that are still present in the
+   * Charge Point from before", and a Pending charge point may only send what it is asked for.
+   * A `ChargePoint` instance models one boot cycle, so reconnects keep the registration.
+   * Set it to `false` if you never send BootNotification through this client. Default: `true`.
+   */
+  readonly holdUntilBootAccepted?: boolean;
 }
 
 /** Connection lifecycle state. */
@@ -141,6 +159,8 @@ export class ChargePoint extends TypedEventEmitter<ChargePointEvents> {
   #running: Promise<void> | undefined;
   readonly #wakers = new Set<() => void>();
   #connectWaiters: Deferred[] = [];
+  readonly #holdUntilBootAccepted: boolean;
+  #registrationStatus: RegistrationStatus | undefined;
 
   constructor(options: ChargePointOptions) {
     super();
@@ -153,6 +173,19 @@ export class ChargePoint extends TypedEventEmitter<ChargePointEvents> {
         options.offlineQueue?.maxSize,
       );
     }
+    this.#holdUntilBootAccepted =
+      options.offlineQueue === false
+        ? false
+        : (options.offlineQueue?.holdUntilBootAccepted ?? true);
+  }
+
+  /**
+   * Status of the latest BootNotification answered on this client, or `undefined` before the
+   * first one. Queued transaction messages are only replayed while it is `Accepted` (see
+   * {@link OfflineQueueOptions.holdUntilBootAccepted}).
+   */
+  get registrationStatus(): RegistrationStatus | undefined {
+    return this.#registrationStatus;
   }
 
   /** Current lifecycle state. */
@@ -217,7 +250,17 @@ export class ChargePoint extends TypedEventEmitter<ChargePointEvents> {
     }
     const peer = this.#peer;
     if (!peer?.isOpen) return Promise.reject(new NotConnectedError(action));
-    return peer.call(action, payload, options);
+    const pending = peer.call(action, payload, options);
+    if (action !== 'BootNotification') return pending;
+    return pending.then((response) => {
+      this.#onBootResponse(response as ChargePointResponse<'BootNotification'>);
+      return response;
+    });
+  }
+
+  #onBootResponse(response: ChargePointResponse<'BootNotification'>): void {
+    this.#registrationStatus = response.status;
+    if (response.status === 'Accepted') void this.#drain();
   }
 
   /**
@@ -273,7 +316,7 @@ export class ChargePoint extends TypedEventEmitter<ChargePointEvents> {
       for (;;) {
         const peer = this.#peer;
         const head = queue.peek();
-        if (!peer?.isOpen || !head || this.#stopped) return;
+        if (!peer?.isOpen || !head || this.#stopped || this.#queueHeld()) return;
         try {
           const response = await peer.call(head.action, head.payload as never);
           await this.#settleQueued(head, response);
@@ -309,6 +352,11 @@ export class ChargePoint extends TypedEventEmitter<ChargePointEvents> {
       deferred?.resolve(outcome);
       this.emit('delivered', message, outcome);
     }
+  }
+
+  /** Whether queued messages must wait for an accepted BootNotification. */
+  #queueHeld(): boolean {
+    return this.#holdUntilBootAccepted && this.#registrationStatus !== 'Accepted';
   }
 
   /** Re-reads the flag; TypeScript would otherwise keep its narrowing across `await`. */

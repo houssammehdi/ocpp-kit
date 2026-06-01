@@ -15,8 +15,21 @@ afterEach(async () => {
   for (const client of clients.splice(0)) await client.close();
 });
 
-function setup(options: Partial<ChargePointOptions> = {}) {
+const boot = { chargePointVendor: 'Acme', chargePointModel: 'X1' };
+
+/**
+ * A client against an in-memory CSMS. Like a real charge point it sends BootNotification once,
+ * on its first connection (`autoBoot: false` skips that).
+ */
+function setup(options: Partial<ChargePointOptions> & { autoBoot?: boolean } = {}) {
+  const { autoBoot = true, ...clientOptions } = options;
   const csms = new FakeCentralSystem();
+  let bootStatus: 'Accepted' | 'Pending' = 'Accepted';
+  csms.handlers.set('BootNotification', () => ({
+    status: bootStatus,
+    currentTime: NOW,
+    interval: 60,
+  }));
   csms.handlers.set('Heartbeat', () => ({ currentTime: NOW }));
   let nextTx = 100;
   csms.handlers.set('StartTransaction', () => ({
@@ -31,10 +44,16 @@ function setup(options: Partial<ChargePointOptions> = {}) {
     connector: csms.connector,
     reconnect: { initialDelayMs: 5, maxDelayMs: 20, resetAfterMs: 1 },
     transactionMessageRetryIntervalMs: 5,
-    ...options,
+    ...clientOptions,
   });
+  if (autoBoot) {
+    cp.once('open', () => void cp.call('BootNotification', boot).catch(() => undefined));
+  }
   clients.push(cp);
-  return { csms, cp };
+  const setBootStatus = (status: 'Accepted' | 'Pending'): void => {
+    bootStatus = status;
+  };
+  return { csms, cp, setBootStatus };
 }
 
 const start = { connectorId: 1, idTag: 'TAG', meterStart: 0, timestamp: NOW };
@@ -178,7 +197,12 @@ describe('ChargePoint offline queue', () => {
     csms.available = true;
     const [startResponse] = await Promise.all([started, sampled, stopped]);
     expect(startResponse.transactionId).toBe(100);
-    expect(csms.received).toEqual(['StartTransaction', 'MeterValues', 'StopTransaction']);
+    expect(csms.received).toEqual([
+      'BootNotification',
+      'StartTransaction',
+      'MeterValues',
+      'StopTransaction',
+    ]);
     expect(cp.queueSize).toBe(0);
   });
 
@@ -193,7 +217,7 @@ describe('ChargePoint offline queue', () => {
       cp.call('StopTransaction', stop(100)),
     ];
     await Promise.all(calls);
-    expect(csms.received.filter((a) => a !== 'Heartbeat')).toEqual([
+    expect(csms.received.filter((a) => a !== 'Heartbeat' && a !== 'BootNotification')).toEqual([
       'StartTransaction',
       'MeterValues',
       'MeterValues',
@@ -281,8 +305,60 @@ describe('ChargePoint offline queue', () => {
   });
 
   it('sends transaction messages directly when the queue is disabled', async () => {
-    const { csms, cp } = setup({ offlineQueue: false });
+    const { csms, cp } = setup({ offlineQueue: false, autoBoot: false });
     await expect(cp.call('StartTransaction', start)).rejects.toBeInstanceOf(NotConnectedError);
+    await cp.connect();
+    await expect(cp.call('StartTransaction', start)).resolves.toMatchObject({ transactionId: 100 });
+    expect(csms.received).toEqual(['StartTransaction']);
+  });
+
+  it('replays cached messages only after BootNotification was accepted', async () => {
+    // Regression: persisted messages used to go out before BootNotification, even while the
+    // registration was Pending (OCPP 1.6 section 4.2 forbids both).
+    const store = new MemoryQueueStore();
+    const cached: QueuedMessage = {
+      seq: 1,
+      action: 'StartTransaction',
+      payload: start,
+      enqueuedAt: NOW,
+    };
+    await store.save([cached]);
+    const { csms, cp, setBootStatus } = setup({ offlineQueue: { store }, autoBoot: false });
+    setBootStatus('Pending');
+    await cp.connect();
+    await expect(cp.call('BootNotification', boot)).resolves.toMatchObject({ status: 'Pending' });
+    expect(cp.registrationStatus).toBe('Pending');
+    const live = cp.call('MeterValues', meter(100, 1));
+    await new Promise((resolve) => setTimeout(resolve, 20));
+    expect(csms.received).toEqual(['BootNotification']);
+    expect(cp.queueSize).toBe(2);
+
+    setBootStatus('Accepted');
+    const delivered = nextEvent(cp, 'delivered');
+    await cp.call('BootNotification', boot);
+    expect((await delivered)[0].action).toBe('StartTransaction');
+    await live;
+    expect(csms.received).toEqual([
+      'BootNotification',
+      'BootNotification',
+      'StartTransaction',
+      'MeterValues',
+    ]);
+  });
+
+  it('keeps the registration across reconnects of the same client', async () => {
+    const { csms, cp } = setup();
+    await cp.connect();
+    await until(() => cp.registrationStatus === 'Accepted');
+    await csms.drop();
+    await until(() => !cp.isConnected);
+    const queued = cp.call('StartTransaction', start);
+    await expect(queued).resolves.toMatchObject({ transactionId: 100 });
+    expect(csms.received.filter((a) => a === 'BootNotification')).toHaveLength(1);
+  });
+
+  it('can replay without a BootNotification when holdUntilBootAccepted is false', async () => {
+    const { csms, cp } = setup({ offlineQueue: { holdUntilBootAccepted: false }, autoBoot: false });
     await cp.connect();
     await expect(cp.call('StartTransaction', start)).resolves.toMatchObject({ transactionId: 100 });
     expect(csms.received).toEqual(['StartTransaction']);
