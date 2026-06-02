@@ -84,8 +84,9 @@ export class OfflineQueueFullError extends OcppKitError {
 /**
  * Ordered, persistent FIFO of transaction-related messages.
  *
- * When full, the oldest `MeterValues` entry is discarded to make room, because periodic samples
- * are the least valuable data; Start/StopTransaction are never discarded (the push fails instead).
+ * When full, the oldest `MeterValues` entry that is not being sent right now is discarded to make
+ * room, because periodic samples are the least valuable data; Start/StopTransaction are never
+ * discarded (the push fails instead).
  */
 export class OfflineQueue {
   readonly #store: OfflineQueueStore;
@@ -93,6 +94,7 @@ export class OfflineQueue {
   #messages: QueuedMessage[] = [];
   #nextSeq = 1;
   #loaded = false;
+  #inFlight: number | undefined;
 
   constructor(store: OfflineQueueStore = new MemoryQueueStore(), maxSize = 10_000) {
     this.#store = store;
@@ -127,6 +129,14 @@ export class OfflineQueue {
     return [...this.#messages];
   }
 
+  /**
+   * Mark the message that is being sent (or `undefined` when none is). It stays queued until it
+   * is removed, but it is never evicted to make room for new messages.
+   */
+  setInFlight(seq: number | undefined): void {
+    this.#inFlight = seq;
+  }
+
   /** Append a message and persist the queue. Returns the discarded message, if any. */
   async push(
     action: QueuedMessage['action'],
@@ -134,7 +144,9 @@ export class OfflineQueue {
   ): Promise<{ message: QueuedMessage; evicted?: QueuedMessage }> {
     let evicted: QueuedMessage | undefined;
     if (this.#messages.length >= this.#maxSize) {
-      const index = this.#messages.findIndex((m) => m.action === 'MeterValues');
+      const index = this.#messages.findIndex(
+        (m) => m.action === 'MeterValues' && m.seq !== this.#inFlight,
+      );
       if (index < 0) throw new OfflineQueueFullError(this.#maxSize);
       [evicted] = this.#messages.splice(index, 1);
     }

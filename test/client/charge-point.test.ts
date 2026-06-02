@@ -262,6 +262,36 @@ describe('ChargePoint offline queue', () => {
     expect(dropped.map((m) => m.action)).toEqual(['MeterValues']);
   });
 
+  it('never evicts the message that is being delivered', async () => {
+    // Regression: a full queue evicted the in-flight MeterValues, which was then reported as
+    // both dropped and delivered.
+    const { csms, cp } = setup({ offlineQueue: { maxSize: 2 } });
+    let release: (() => void) | undefined;
+    csms.handlers.set('MeterValues', async () => {
+      await new Promise<void>((resolve) => (release = resolve));
+      return {};
+    });
+    const dropped: number[] = [];
+    const delivered: number[] = [];
+    cp.on('dropped', (message) => dropped.push(message.seq));
+    cp.on('delivered', (message) => delivered.push(message.seq));
+    await cp.connect();
+    const first = cp.call('MeterValues', meter(1, 1));
+    await until(() => release !== undefined);
+    const second = cp.call('MeterValues', meter(1, 2)).catch((e: unknown) => e);
+    const third = cp.call('MeterValues', meter(1, 3));
+    expect(await second).toMatchObject({ message: 'Evicted from a full offline queue' });
+    const releaseFirst = release!;
+    release = undefined;
+    releaseFirst();
+    await expect(first).resolves.toEqual({});
+    await until(() => release !== undefined);
+    release!();
+    await expect(third).resolves.toEqual({});
+    expect(dropped).toEqual([2]);
+    expect(delivered).toEqual([1, 3]);
+  });
+
   it('recovers when a later attempt succeeds', async () => {
     const { csms, cp } = setup();
     let calls = 0;

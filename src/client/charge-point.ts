@@ -317,6 +317,7 @@ export class ChargePoint extends TypedEventEmitter<ChargePointEvents> {
         const peer = this.#peer;
         const head = queue.peek();
         if (!peer?.isOpen || !head || this.#stopped || this.#queueHeld()) return;
+        queue.setInFlight(head.seq);
         try {
           const response = await peer.call(head.action, head.payload as never);
           await this.#settleQueued(head, response);
@@ -333,6 +334,8 @@ export class ChargePoint extends TypedEventEmitter<ChargePointEvents> {
             this.#attempts.set(head.seq, attempts);
             await this.#sleep(retryInterval * attempts);
           }
+        } finally {
+          queue.setInFlight(undefined);
         }
       }
     } finally {
