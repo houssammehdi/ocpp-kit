@@ -577,6 +577,15 @@ describe('SimulatedCharger remote control', () => {
     });
   });
 
+  it('answers GetConfiguration for too many keys with OccurenceConstraintViolation', async () => {
+    const { csms } = await started();
+    const keys = Array.from({ length: 101 }, (_, i) => `Key${i}`);
+    await expect(csms.current!.call('GetConfiguration', { key: keys })).rejects.toMatchObject({
+      code: 'OccurenceConstraintViolation',
+      remote: true,
+    });
+  });
+
   it('reports inbound validation failures to the CSMS with OCPP error codes', async () => {
     const { csms } = await started();
     // @ts-expect-error -- invalid on purpose

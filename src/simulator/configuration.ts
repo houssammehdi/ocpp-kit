@@ -1,9 +1,11 @@
 import {
+  ciKey,
   Measurand,
   type ConfigurationStatus,
   type GetConfigurationResponse,
   type KeyValue,
 } from '../messages/index.js';
+import { RpcError } from '../rpc/errors.js';
 
 /** Value kinds used to validate ChangeConfiguration requests. */
 export type ConfigValueType = 'integer' | 'boolean' | 'string' | 'measurands';
@@ -31,7 +33,8 @@ function isValid(definition: ConfigKeyDefinition, value: string): boolean {
       return Number(value) >= (definition.min ?? Number.MIN_SAFE_INTEGER);
     }
     case 'boolean':
-      return value === 'true' || value === 'false';
+      // Values are CiStrings, so "TRUE" is as good as "true".
+      return /^(true|false)$/i.test(value);
     case 'measurands':
       return value === '' || value.split(',').every((item) => MEASURANDS.has(item.trim()));
     case 'string':
@@ -49,18 +52,22 @@ export type ConfigChangeListener = (key: string, value: string) => void;
 export class ConfigurationStore {
   readonly #entries = new Map<string, { definition: ConfigKeyDefinition; value: string }>();
   readonly #listeners: ConfigChangeListener[] = [];
-  readonly #maxKeys: number;
+  readonly #defaultMaxKeys: number;
 
+  /**
+   * @param maxKeys - limit of keys per GetConfiguration request when the store has no
+   *   `GetConfigurationMaxKeys` key
+   */
   constructor(definitions: readonly ConfigKeyDefinition[], maxKeys = 100) {
     for (const definition of definitions) {
-      this.#entries.set(definition.key.toLowerCase(), { definition, value: definition.value });
+      this.#entries.set(ciKey(definition.key), { definition, value: definition.value });
     }
-    this.#maxKeys = maxKeys;
+    this.#defaultMaxKeys = maxKeys;
   }
 
   /** Raw value of `key`, if defined. */
   get(key: string): string | undefined {
-    return this.#entries.get(key.toLowerCase())?.value;
+    return this.#entries.get(ciKey(key))?.value;
   }
 
   /** Integer value of `key`, or `fallback` when missing or not an integer. */
@@ -72,7 +79,7 @@ export class ConfigurationStore {
   /** Boolean value of `key`, or `fallback` when missing. */
   getBoolean(key: string, fallback: boolean): boolean {
     const value = this.get(key);
-    return value === undefined ? fallback : value === 'true';
+    return value === undefined ? fallback : value.toLowerCase() === 'true';
   }
 
   /** Comma-separated list value of `key`. */
@@ -88,7 +95,7 @@ export class ConfigurationStore {
 
   /** Set a value internally, bypassing read-only protection (e.g. firmware-managed keys). */
   set(key: string, value: string): void {
-    const entry = this.#entries.get(key.toLowerCase());
+    const entry = this.#entries.get(ciKey(key));
     if (!entry) throw new RangeError(`Unknown configuration key ${key}`);
     entry.value = value;
     for (const listener of this.#listeners) listener(entry.definition.key, value);
@@ -96,14 +103,27 @@ export class ConfigurationStore {
 
   /** Apply a ChangeConfiguration request. */
   change(key: string, value: string): ConfigurationStatus {
-    const entry = this.#entries.get(key.toLowerCase());
+    const entry = this.#entries.get(ciKey(key));
     if (!entry) return 'NotSupported';
     if (entry.definition.readonly || !isValid(entry.definition, value)) return 'Rejected';
-    this.set(entry.definition.key, value);
+    this.set(
+      entry.definition.key,
+      entry.definition.type === 'boolean' ? value.toLowerCase() : value,
+    );
     return entry.definition.rebootRequired ? 'RebootRequired' : 'Accepted';
   }
 
-  /** Answer a GetConfiguration request. */
+  /** Maximum number of keys in one GetConfiguration request (`GetConfigurationMaxKeys`). */
+  get maxKeys(): number {
+    return this.getInteger('GetConfigurationMaxKeys', this.#defaultMaxKeys);
+  }
+
+  /**
+   * Answer a GetConfiguration request.
+   *
+   * @throws {@link RpcError} `OccurenceConstraintViolation` when more keys are requested than
+   *   `GetConfigurationMaxKeys` allows; answering only some of them would silently drop keys.
+   */
   getConfiguration(keys?: readonly string[]): GetConfigurationResponse {
     const toKeyValue = ({
       definition,
@@ -119,10 +139,16 @@ export class ConfigurationStore {
     if (!keys || keys.length === 0) {
       return { configurationKey: [...this.#entries.values()].map(toKeyValue) };
     }
+    if (keys.length > this.maxKeys) {
+      throw new RpcError(
+        'OccurenceConstraintViolation',
+        `At most ${this.maxKeys} keys may be requested at once (GetConfigurationMaxKeys)`,
+      );
+    }
     const configurationKey: KeyValue[] = [];
     const unknownKey: string[] = [];
-    for (const key of keys.slice(0, this.#maxKeys)) {
-      const entry = this.#entries.get(key.toLowerCase());
+    for (const key of keys) {
+      const entry = this.#entries.get(ciKey(key));
       if (entry) configurationKey.push(toKeyValue(entry));
       else unknownKey.push(key);
     }

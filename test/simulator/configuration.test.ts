@@ -1,5 +1,5 @@
 import { describe, expect, it, vi } from 'vitest';
-import { ConfigurationStore, defaultConfiguration } from '../../src/index.js';
+import { ConfigurationStore, defaultConfiguration, RpcError } from '../../src/index.js';
 
 const store = () => new ConfigurationStore(defaultConfiguration({ connectors: 2 }), 3);
 
@@ -56,10 +56,28 @@ describe('ConfigurationStore', () => {
     expect(config.getConfiguration(['Nope'])).toEqual({ unknownKey: ['Nope'] });
   });
 
-  it('limits the number of requested keys to GetConfigurationMaxKeys', () => {
+  it('refuses requests for more keys than GetConfigurationMaxKeys instead of truncating', () => {
+    // Regression: extra keys used to vanish from the answer (neither known nor unknown).
     const config = store();
-    const response = config.getConfiguration(['A', 'B', 'C', 'D', 'E']);
-    expect(response.unknownKey).toEqual(['A', 'B', 'C']);
+    config.set('GetConfigurationMaxKeys', '3');
+    expect(config.maxKeys).toBe(3);
+    expect(config.getConfiguration(['A', 'B', 'C']).unknownKey).toEqual(['A', 'B', 'C']);
+    expect(() => config.getConfiguration(['A', 'B', 'C', 'D'])).toThrow(
+      expect.objectContaining({ code: 'OccurenceConstraintViolation' }),
+    );
+    // Without the key, the constructor limit applies.
+    const bare = new ConfigurationStore([], 2);
+    expect(bare.maxKeys).toBe(2);
+    expect(() => bare.getConfiguration(['A', 'B', 'C'])).toThrow(RpcError);
+  });
+
+  it('accepts boolean values in any case, since values are CiStrings', () => {
+    const config = store();
+    expect(config.change('LocalAuthorizeOffline', 'FALSE')).toBe('Accepted');
+    expect(config.get('LocalAuthorizeOffline')).toBe('false');
+    expect(config.getBoolean('LocalAuthorizeOffline', true)).toBe(false);
+    expect(config.change('LocalAuthorizeOffline', 'True')).toBe('Accepted');
+    expect(config.getBoolean('LocalAuthorizeOffline', false)).toBe(true);
   });
 
   it('allows firmware-side updates of read-only keys and falls back for bad values', () => {
