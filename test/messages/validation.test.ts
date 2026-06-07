@@ -1,14 +1,27 @@
 import { describe, expect, it } from 'vitest';
 import {
+  ACTION_PROFILES,
   BootNotificationRequest,
   BootNotificationResponse,
+  CancelReservationRequest,
   CentralSystemToChargePoint,
   ChargePointToCentralSystem,
+  DiagnosticsStatusNotificationRequest,
+  FEATURE_PROFILES,
+  FirmwareStatusNotificationRequest,
+  GetDiagnosticsRequest,
+  GetDiagnosticsResponse,
+  GetLocalListVersionResponse,
   MeterValuesRequest,
+  ReserveNowRequest,
+  ReserveNowResponse,
+  SendLocalListRequest,
+  SendLocalListResponse,
   SetChargingProfileRequest,
   StartTransactionRequest,
   StatusNotificationRequest,
   TriggerMessageRequest,
+  UpdateFirmwareRequest,
 } from '../../src/messages/index.js';
 import { collectIssues, validatePayload, type ActionSchema } from '../../src/rpc/index.js';
 
@@ -159,11 +172,13 @@ describe('payload validation', () => {
 });
 
 describe('message catalogue', () => {
-  it('covers the Core profile and Smart Charging in both directions', () => {
+  it('covers all 28 OCPP 1.6 messages in the right direction', () => {
     expect(Object.keys(ChargePointToCentralSystem).sort()).toEqual([
       'Authorize',
       'BootNotification',
       'DataTransfer',
+      'DiagnosticsStatusNotification',
+      'FirmwareStatusNotification',
       'Heartbeat',
       'MeterValues',
       'StartTransaction',
@@ -171,6 +186,7 @@ describe('message catalogue', () => {
       'StopTransaction',
     ]);
     expect(Object.keys(CentralSystemToChargePoint).sort()).toEqual([
+      'CancelReservation',
       'ChangeAvailability',
       'ChangeConfiguration',
       'ClearCache',
@@ -178,13 +194,43 @@ describe('message catalogue', () => {
       'DataTransfer',
       'GetCompositeSchedule',
       'GetConfiguration',
+      'GetDiagnostics',
+      'GetLocalListVersion',
       'RemoteStartTransaction',
       'RemoteStopTransaction',
+      'ReserveNow',
       'Reset',
+      'SendLocalList',
       'SetChargingProfile',
       'TriggerMessage',
       'UnlockConnector',
+      'UpdateFirmware',
     ]);
+    const all = new Set([
+      ...Object.keys(ChargePointToCentralSystem),
+      ...Object.keys(CentralSystemToChargePoint),
+    ]);
+    expect(all.size).toBe(28);
+  });
+
+  it('assigns every action to one of the six feature profiles', () => {
+    const all = [
+      ...new Set([
+        ...Object.keys(ChargePointToCentralSystem),
+        ...Object.keys(CentralSystemToChargePoint),
+      ]),
+    ].sort();
+    expect(Object.keys(ACTION_PROFILES).sort()).toEqual(all);
+    const counts = Object.fromEntries(FEATURE_PROFILES.map((profile) => [profile, 0]));
+    for (const profile of Object.values(ACTION_PROFILES)) counts[profile]! += 1;
+    expect(counts).toEqual({
+      Core: 16,
+      FirmwareManagement: 4,
+      LocalAuthListManagement: 2,
+      Reservation: 2,
+      SmartCharging: 3,
+      RemoteTrigger: 1,
+    });
   });
 
   it('forbids additional properties on every request and response object', () => {
@@ -194,6 +240,125 @@ describe('message catalogue', () => {
         expect(request.additionalProperties, `${action} request`).toBe(false);
         expect(response.additionalProperties, `${action} response`).toBe(false);
       }
+    }
+  });
+});
+
+describe('Firmware Management, Local Auth List and Reservation PDUs', () => {
+  it('validates firmware and diagnostics requests, including the location URI', () => {
+    const update = { location: 'https://fw.example.com/acme-2.1.bin', retrieveDate: now };
+    expect(validatePayload(UpdateFirmwareRequest, update)).toBeUndefined();
+    expect(
+      validatePayload(UpdateFirmwareRequest, { ...update, retries: 3, retryInterval: 30 }),
+    ).toBeUndefined();
+    expect(validatePayload(UpdateFirmwareRequest, { location: update.location })?.code).toBe(
+      'OccurenceConstraintViolation',
+    );
+    for (const location of ['not a uri', '/relative/path', 'ftp:']) {
+      expect(validatePayload(UpdateFirmwareRequest, { ...update, location })?.code).toBe(
+        'PropertyConstraintViolation',
+      );
+    }
+    expect(validatePayload(UpdateFirmwareRequest, { ...update, retries: -1 })?.code).toBe(
+      'PropertyConstraintViolation',
+    );
+    expect(
+      validatePayload(GetDiagnosticsRequest, {
+        location: 'ftp://user:secret@logs.example.com/uploads/',
+        startTime: now,
+        stopTime: now,
+      }),
+    ).toBeUndefined();
+    expect(validatePayload(GetDiagnosticsResponse, {})).toBeUndefined();
+    expect(validatePayload(GetDiagnosticsResponse, { fileName: 'x'.repeat(256) })?.code).toBe(
+      'PropertyConstraintViolation',
+    );
+    for (const status of [
+      'Downloading',
+      'Downloaded',
+      'DownloadFailed',
+      'Installing',
+      'Installed',
+      'InstallationFailed',
+      'Idle',
+    ]) {
+      expect(validatePayload(FirmwareStatusNotificationRequest, { status })).toBeUndefined();
+    }
+    for (const status of ['Uploading', 'Uploaded', 'UploadFailed', 'Idle']) {
+      expect(validatePayload(DiagnosticsStatusNotificationRequest, { status })).toBeUndefined();
+    }
+    expect(validatePayload(DiagnosticsStatusNotificationRequest, { status: 'Done' })?.code).toBe(
+      'PropertyConstraintViolation',
+    );
+  });
+
+  it('validates local list updates', () => {
+    const full = {
+      listVersion: 3,
+      updateType: 'Full',
+      localAuthorizationList: [
+        { idTag: 'CARD-1', idTagInfo: { status: 'Accepted', parentIdTag: 'FLEET-A' } },
+        { idTag: 'CARD-2', idTagInfo: { status: 'Blocked', expiryDate: now } },
+      ],
+    };
+    expect(validatePayload(SendLocalListRequest, full)).toBeUndefined();
+    expect(
+      validatePayload(SendLocalListRequest, {
+        listVersion: 4,
+        updateType: 'Differential',
+        localAuthorizationList: [{ idTag: 'CARD-2' }],
+      }),
+    ).toBeUndefined();
+    expect(validatePayload(SendLocalListRequest, { ...full, updateType: 'Partial' })?.code).toBe(
+      'PropertyConstraintViolation',
+    );
+    expect(validatePayload(GetLocalListVersionResponse, { listVersion: -1 })).toBeUndefined();
+    expect(validatePayload(GetLocalListVersionResponse, { listVersion: -2 })?.code).toBe(
+      'PropertyConstraintViolation',
+    );
+    expect(validatePayload(SendLocalListResponse, { status: 'VersionMismatch' })).toBeUndefined();
+  });
+
+  it('validates reservations, including connector 0', () => {
+    const reservation = {
+      connectorId: 0,
+      expiryDate: now,
+      idTag: 'CARD-1',
+      parentIdTag: 'FLEET-A',
+      reservationId: 17,
+    };
+    expect(validatePayload(ReserveNowRequest, reservation)).toBeUndefined();
+    expect(
+      validatePayload(ReserveNowRequest, { ...reservation, idTag: 'x'.repeat(21) })?.code,
+    ).toBe('PropertyConstraintViolation');
+    for (const status of ['Accepted', 'Faulted', 'Occupied', 'Rejected', 'Unavailable']) {
+      expect(validatePayload(ReserveNowResponse, { status })).toBeUndefined();
+    }
+    expect(validatePayload(CancelReservationRequest, { reservationId: '17' })?.code).toBe(
+      'TypeConstraintViolation',
+    );
+  });
+
+  it('accepts StartTransaction with a reservationId', () => {
+    expect(
+      validatePayload(StartTransactionRequest, {
+        connectorId: 1,
+        idTag: 'CARD-1',
+        meterStart: 0,
+        reservationId: 17,
+        timestamp: now,
+      }),
+    ).toBeUndefined();
+  });
+
+  it('accepts the unit spellings chargers use in the field', () => {
+    for (const unit of ['Celcius', 'Celsius', 'Hertz']) {
+      expect(
+        validatePayload(MeterValuesRequest, {
+          connectorId: 0,
+          meterValue: [{ timestamp: now, sampledValue: [{ value: '1', unit }] }],
+        }),
+      ).toBeUndefined();
     }
   });
 });

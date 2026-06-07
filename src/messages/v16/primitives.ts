@@ -1,7 +1,19 @@
-import { Type, type TLiteral, type TString, type TUnion, type TInteger } from '@sinclair/typebox';
+import {
+  Type,
+  type TInteger,
+  type TLiteral,
+  type TObject,
+  type TString,
+  type TUnion,
+} from '@sinclair/typebox';
 
 /** Options shared by every PDU object: OCPP 1.6 JSON schemas forbid undeclared properties. */
 export const strict = { additionalProperties: false } as const;
+
+/** A PDU without fields, e.g. `Heartbeat.req` or `StatusNotification.conf`. */
+export function EmptyObject(): TObject {
+  return Type.Object({}, strict);
+}
 
 /**
  * Case-insensitive string with a maximum length (`CiStringNType` in the specification).
@@ -48,6 +60,20 @@ export const DATE_TIME_PATTERN =
 export function DateTime(description?: string): TString {
   return Type.String({
     pattern: DATE_TIME_PATTERN,
+    ...(description === undefined ? {} : { description }),
+  });
+}
+
+/**
+ * An absolute URI (`anyURI` in the specification, `format: uri` in the official JSON schemas):
+ * a scheme such as `ftp:` or `https:` followed by at least one character and no whitespace.
+ */
+export const URI_PATTERN = '^[A-Za-z][A-Za-z0-9+.-]*:\\S+$';
+
+/** `anyURI`, e.g. the location of a firmware image or of a diagnostics upload. */
+export function AnyUri(description?: string): TString {
+  return Type.String({
+    pattern: URI_PATTERN,
     ...(description === undefined ? {} : { description }),
   });
 }

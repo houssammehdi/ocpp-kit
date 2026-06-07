@@ -1,5 +1,9 @@
 import type { ActionName, RequestOf, ResponseOf } from '../../rpc/validation.js';
 import * as core from './core.js';
+import * as fw from './firmware.js';
+import * as lal from './local-auth-list.js';
+import * as rt from './remote-trigger.js';
+import * as res from './reservation.js';
 import * as sc from './smart-charging.js';
 
 /**
@@ -7,6 +11,7 @@ import * as sc from './smart-charging.js';
  * This object drives both runtime validation and the static types of `call()` and `handle()`.
  */
 export const ChargePointToCentralSystem = {
+  // Core
   Authorize: { request: core.AuthorizeRequest, response: core.AuthorizeResponse },
   BootNotification: {
     request: core.BootNotificationRequest,
@@ -24,10 +29,20 @@ export const ChargePointToCentralSystem = {
     response: core.StatusNotificationResponse,
   },
   StopTransaction: { request: core.StopTransactionRequest, response: core.StopTransactionResponse },
+  // Firmware Management
+  DiagnosticsStatusNotification: {
+    request: fw.DiagnosticsStatusNotificationRequest,
+    response: fw.DiagnosticsStatusNotificationResponse,
+  },
+  FirmwareStatusNotification: {
+    request: fw.FirmwareStatusNotificationRequest,
+    response: fw.FirmwareStatusNotificationResponse,
+  },
 } as const;
 
 /** Actions the Central System sends to a Charge Point. */
 export const CentralSystemToChargePoint = {
+  // Core
   ChangeAvailability: {
     request: core.ChangeAvailabilityRequest,
     response: core.ChangeAvailabilityResponse,
@@ -55,7 +70,24 @@ export const CentralSystemToChargePoint = {
     request: core.UnlockConnectorRequest,
     response: core.UnlockConnectorResponse,
   },
-  TriggerMessage: { request: core.TriggerMessageRequest, response: core.TriggerMessageResponse },
+  // Firmware Management
+  GetDiagnostics: { request: fw.GetDiagnosticsRequest, response: fw.GetDiagnosticsResponse },
+  UpdateFirmware: { request: fw.UpdateFirmwareRequest, response: fw.UpdateFirmwareResponse },
+  // Local Auth List Management
+  GetLocalListVersion: {
+    request: lal.GetLocalListVersionRequest,
+    response: lal.GetLocalListVersionResponse,
+  },
+  SendLocalList: { request: lal.SendLocalListRequest, response: lal.SendLocalListResponse },
+  // Reservation
+  CancelReservation: {
+    request: res.CancelReservationRequest,
+    response: res.CancelReservationResponse,
+  },
+  ReserveNow: { request: res.ReserveNowRequest, response: res.ReserveNowResponse },
+  // Remote Trigger
+  TriggerMessage: { request: rt.TriggerMessageRequest, response: rt.TriggerMessageResponse },
+  // Smart Charging
   SetChargingProfile: {
     request: sc.SetChargingProfileRequest,
     response: sc.SetChargingProfileResponse,
@@ -79,6 +111,8 @@ export type CentralSystemToChargePoint = typeof CentralSystemToChargePoint;
 export type ChargePointAction = ActionName<ChargePointToCentralSystem>;
 /** Name of an action initiated by the Central System. */
 export type CentralSystemAction = ActionName<CentralSystemToChargePoint>;
+/** Any of the 28 OCPP 1.6 actions (DataTransfer exists in both directions). */
+export type Action = ChargePointAction | CentralSystemAction;
 
 /** Request payload of a Charge Point initiated action, e.g. `ChargePointRequest<'Authorize'>`. */
 export type ChargePointRequest<A extends ChargePointAction> = RequestOf<
@@ -100,6 +134,54 @@ export type CentralSystemResponse<A extends CentralSystemAction> = ResponseOf<
   CentralSystemToChargePoint,
   A
 >;
+
+/**
+ * The six OCPP 1.6 feature profiles, spelled as in the `SupportedFeatureProfiles` configuration
+ * key.
+ */
+export const FEATURE_PROFILES = [
+  'Core',
+  'FirmwareManagement',
+  'LocalAuthListManagement',
+  'Reservation',
+  'SmartCharging',
+  'RemoteTrigger',
+] as const;
+
+/** An OCPP 1.6 feature profile. */
+export type FeatureProfile = (typeof FEATURE_PROFILES)[number];
+
+/** The feature profile each action belongs to. */
+export const ACTION_PROFILES: Readonly<Record<Action, FeatureProfile>> = {
+  Authorize: 'Core',
+  BootNotification: 'Core',
+  ChangeAvailability: 'Core',
+  ChangeConfiguration: 'Core',
+  ClearCache: 'Core',
+  DataTransfer: 'Core',
+  GetConfiguration: 'Core',
+  Heartbeat: 'Core',
+  MeterValues: 'Core',
+  RemoteStartTransaction: 'Core',
+  RemoteStopTransaction: 'Core',
+  Reset: 'Core',
+  StartTransaction: 'Core',
+  StatusNotification: 'Core',
+  StopTransaction: 'Core',
+  UnlockConnector: 'Core',
+  DiagnosticsStatusNotification: 'FirmwareManagement',
+  FirmwareStatusNotification: 'FirmwareManagement',
+  GetDiagnostics: 'FirmwareManagement',
+  UpdateFirmware: 'FirmwareManagement',
+  GetLocalListVersion: 'LocalAuthListManagement',
+  SendLocalList: 'LocalAuthListManagement',
+  CancelReservation: 'Reservation',
+  ReserveNow: 'Reservation',
+  ClearChargingProfile: 'SmartCharging',
+  GetCompositeSchedule: 'SmartCharging',
+  SetChargingProfile: 'SmartCharging',
+  TriggerMessage: 'RemoteTrigger',
+};
 
 /** Transaction-related actions (see {@link isTransactionAction}). */
 export type TransactionAction = 'StartTransaction' | 'StopTransaction' | 'MeterValues';
