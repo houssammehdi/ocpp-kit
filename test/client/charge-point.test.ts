@@ -170,6 +170,22 @@ describe('ChargePoint connection', () => {
     expect(csms.requests).toHaveLength(1);
   });
 
+  it('reconnectAfter() closes the link and reconnects after the given delay', async () => {
+    vi.useFakeTimers();
+    const { csms, cp } = setup({ reconnect: false });
+    await cp.connect();
+    const delays: number[] = [];
+    cp.on('reconnecting', (_attempt, delay) => delays.push(delay));
+    await cp.reconnectAfter(5_000, 'Registration rejected');
+    expect(cp.isConnected).toBe(false);
+    expect(delays).toEqual([5_000]);
+    await vi.advanceTimersByTimeAsync(4_999);
+    expect(csms.requests).toHaveLength(1);
+    await vi.advanceTimersByTimeAsync(1);
+    expect(csms.requests).toHaveLength(2);
+    expect(cp.isConnected).toBe(true);
+  });
+
   it('close() stops a pending reconnect loop', async () => {
     const { csms, cp } = setup({ reconnect: { initialDelayMs: 60_000 } });
     csms.available = false;

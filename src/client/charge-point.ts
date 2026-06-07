@@ -161,6 +161,8 @@ export class ChargePoint extends TypedEventEmitter<ChargePointEvents> {
   #connectWaiters: Deferred[] = [];
   readonly #holdUntilBootAccepted: boolean;
   #registrationStatus: RegistrationStatus | undefined;
+  /** Delay of the next reconnect when {@link reconnectAfter} asked for one. */
+  #reconnectDelay: number | undefined;
 
   constructor(options: ChargePointOptions) {
     super();
@@ -261,6 +263,19 @@ export class ChargePoint extends TypedEventEmitter<ChargePointEvents> {
   #onBootResponse(response: ChargePointResponse<'BootNotification'>): void {
     this.#registrationStatus = response.status;
     if (response.status === 'Accepted') void this.#drain();
+  }
+
+  /**
+   * Close the current connection and connect again after `delayMs` instead of the backoff
+   * delay, keeping the offline queue and pending calls. A charge point whose BootNotification was
+   * Rejected can use it to stay off the network until the retry interval has passed (OCPP 1.6
+   * section 4.2). The reconnect happens even when automatic reconnects are disabled.
+   */
+  async reconnectAfter(delayMs: number, reason = 'Reconnecting'): Promise<void> {
+    if (this.#stopped) return;
+    this.#reconnectDelay = delayMs;
+    const peer = this.#peer;
+    if (peer) await peer.close(1000, reason);
   }
 
   /**
@@ -458,7 +473,16 @@ export class ChargePoint extends TypedEventEmitter<ChargePointEvents> {
       const { code, reason } = await closed;
       this.#peer = undefined;
       this.emit('close', code, reason);
-      if (reconnect === false || this.#isStopped()) break;
+      if (this.#isStopped()) break;
+      const requestedDelay = this.#reconnectDelay;
+      if (requestedDelay !== undefined) {
+        this.#reconnectDelay = undefined;
+        this.#state = 'reconnecting';
+        this.emit('reconnecting', 1, requestedDelay);
+        await this.#sleep(requestedDelay);
+        continue;
+      }
+      if (reconnect === false) break;
       // Only a connection that stayed up for a while resets the backoff, so a server that
       // accepts and immediately drops connections is not hammered.
       if (Date.now() - openedAt >= resetAfterMs) backoffStep = 0;

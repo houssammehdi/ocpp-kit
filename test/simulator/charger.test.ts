@@ -153,6 +153,76 @@ describe('SimulatedCharger boot and heartbeat', () => {
     expect(csms.requestsOf('BootNotification')).toHaveLength(1);
   });
 
+  it('retries a BootNotification that failed with a CALLERROR', async () => {
+    // Regression: a failed boot was never retried, leaving the charger unregistered.
+    const { csms, charger } = setup({ bootRetryS: 15 });
+    let calls = 0;
+    csms.handlers.set('BootNotification', () => {
+      calls++;
+      if (calls === 1) throw new RpcError('InternalError', 'starting up');
+      return { status: 'Accepted', currentTime: new Date().toISOString(), interval: 60 };
+    });
+    await charger.start();
+    await advance(1);
+    expect(charger.isRegistered).toBe(false);
+    await advance(15);
+    expect(calls).toBe(2);
+    expect(charger.isRegistered).toBe(true);
+  });
+
+  it('serves TriggerMessage but refuses remote start/stop while Pending', async () => {
+    const { csms, charger } = setup();
+    csms.handlers.set('BootNotification', () => ({
+      status: 'Pending',
+      currentTime: new Date().toISOString(),
+      interval: 300,
+    }));
+    await charger.start();
+    await advance(1);
+    expect(charger.registrationStatus).toBe('Pending');
+    const cs = csms.current!;
+    await expect(
+      cs.call('RemoteStartTransaction', { idTag: 'APP', connectorId: 1 }),
+    ).resolves.toEqual({ status: 'Rejected' });
+    await expect(cs.call('RemoteStopTransaction', { transactionId: 1 })).resolves.toEqual({
+      status: 'Rejected',
+    });
+    await expect(cs.call('GetConfiguration', { key: ['NumberOfConnectors'] })).resolves.toEqual({
+      configurationKey: [{ key: 'NumberOfConnectors', readonly: true, value: '2' }],
+    });
+    // Regression: triggered StatusNotifications used to be suppressed until Accepted.
+    await expect(
+      cs.call('TriggerMessage', { requestedMessage: 'StatusNotification', connectorId: 1 }),
+    ).resolves.toEqual({ status: 'Accepted' });
+    await advance(0);
+    expect(csms.received).toEqual([
+      'BootNotification',
+      'StatusNotification', // only the triggered one
+    ]);
+  });
+
+  it('goes offline until the retry interval has passed when Rejected', async () => {
+    const { csms, charger } = setup();
+    let status: 'Rejected' | 'Accepted' = 'Rejected';
+    csms.handlers.set('BootNotification', () => ({
+      status,
+      currentTime: new Date().toISOString(),
+      interval: 120,
+    }));
+    await charger.start();
+    await advance(1);
+    expect(charger.registrationStatus).toBe('Rejected');
+    expect(charger.isConnected).toBe(false);
+    expect(csms.peers).toHaveLength(1);
+    await advance(118);
+    expect(csms.peers).toHaveLength(1);
+    status = 'Accepted';
+    await advance(2);
+    expect(csms.peers).toHaveLength(2);
+    expect(charger.isRegistered).toBe(true);
+    expect(csms.requestsOf('BootNotification')).toHaveLength(2);
+  });
+
   it('restarts the heartbeat when HeartbeatInterval changes', async () => {
     const { csms } = await started();
     await expect(

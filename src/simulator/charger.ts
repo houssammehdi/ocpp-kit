@@ -11,6 +11,7 @@ import type {
   ChargingProfile,
   MeterValue,
   ReadingContext,
+  RegistrationStatus,
   SampledValue,
   StopReason,
 } from '../messages/index.js';
@@ -219,7 +220,9 @@ export class SimulatedCharger extends TypedEventEmitter<SimulatedChargerEvents> 
   readonly #queueStore: OfflineQueueStore;
   readonly #timers = new Set<NodeJS.Timeout>();
   #client: ChargePoint;
-  #registered = false;
+  /** Status of the latest BootNotification answer in the current boot cycle. */
+  #registration: RegistrationStatus | undefined;
+  #bootRetry: NodeJS.Timeout | undefined;
   #stopped = true;
   #rebooting = false;
   #stationAvailable = true;
@@ -258,7 +261,7 @@ export class SimulatedCharger extends TypedEventEmitter<SimulatedChargerEvents> 
       ...(options.configuration ?? []),
     ]);
     this.configuration.onChange((key) => {
-      if (key === 'HeartbeatInterval' && this.#registered) this.#startHeartbeat();
+      if (key === 'HeartbeatInterval' && this.isRegistered) this.#startHeartbeat();
     });
     this.profiles = new ChargingProfileManager({
       connectors: count,
@@ -279,7 +282,12 @@ export class SimulatedCharger extends TypedEventEmitter<SimulatedChargerEvents> 
 
   /** Whether the last BootNotification was accepted. */
   get isRegistered(): boolean {
-    return this.#registered;
+    return this.#registration === 'Accepted';
+  }
+
+  /** Status of the latest BootNotification answer since the last (re)boot, if any. */
+  get registrationStatus(): RegistrationStatus | undefined {
+    return this.#registration;
   }
 
   /** Snapshot of every connector. */
@@ -300,7 +308,7 @@ export class SimulatedCharger extends TypedEventEmitter<SimulatedChargerEvents> 
   stats(): ChargerStats {
     return {
       connected: this.isConnected,
-      registered: this.#registered,
+      registered: this.isRegistered,
       activeTransactions: this.#connectors.filter((c) => c.tx && !c.tx.stopping).length,
       sessionsStarted: this.#sessionsStarted,
       sessionsCompleted: this.#sessionsCompleted,
@@ -329,6 +337,7 @@ export class SimulatedCharger extends TypedEventEmitter<SimulatedChargerEvents> 
     this.#stopped = true;
     for (const timer of this.#timers) clearTimeout(timer);
     this.#timers.clear();
+    if (this.#bootRetry) clearTimeout(this.#bootRetry);
     if (this.#tick) clearInterval(this.#tick);
     if (this.#heartbeat) clearInterval(this.#heartbeat);
     for (const c of this.#connectors) {
@@ -469,7 +478,7 @@ export class SimulatedCharger extends TypedEventEmitter<SimulatedChargerEvents> 
     });
     client.on('open', () => {
       this.emit('connection', true);
-      if (this.#registered) this.#sendAllStatuses();
+      if (this.isRegistered) this.#sendAllStatuses();
       else void this.#boot();
     });
     client.on('close', () => {
@@ -520,6 +529,8 @@ export class SimulatedCharger extends TypedEventEmitter<SimulatedChargerEvents> 
   }
 
   async #boot(): Promise<void> {
+    if (this.#bootRetry) clearTimeout(this.#bootRetry);
+    this.#bootRetry = undefined;
     const { vendor = 'ocpp-kit', model = 'Simulator', firmwareVersion } = this.#options;
     const response = await this.#call('BootNotification', {
       chargePointVendor: vendor.slice(0, 20),
@@ -527,9 +538,15 @@ export class SimulatedCharger extends TypedEventEmitter<SimulatedChargerEvents> 
       chargePointSerialNumber: this.identity.slice(0, 25),
       ...(firmwareVersion === undefined ? {} : { firmwareVersion }),
     });
-    if (!response || this.#stopped) return;
+    if (this.#stopped || this.#rebooting) return;
+    const fallbackS = this.#options.bootRetryS ?? 30;
+    if (!response) {
+      // Timeout or CALLERROR: try again later. (A lost connection boots again on reconnect.)
+      this.#scheduleBootRetry(fallbackS);
+      return;
+    }
+    this.#registration = response.status;
     if (response.status === 'Accepted') {
-      this.#registered = true;
       if (response.interval > 0) {
         this.configuration.set('HeartbeatInterval', String(response.interval));
       }
@@ -541,10 +558,28 @@ export class SimulatedCharger extends TypedEventEmitter<SimulatedChargerEvents> 
       }
       return;
     }
-    const retryS = response.interval > 0 ? response.interval : (this.#options.bootRetryS ?? 30);
-    this.#later(retryS * 1_000, () => {
-      if (this.#client.isConnected && !this.#registered) void this.#boot();
-    });
+    // OCPP 1.6 section 4.2: the interval is the minimum wait before the next BootNotification;
+    // for 0 the charge point picks its own.
+    const retryS = response.interval > 0 ? response.interval : fallbackS;
+    if (response.status === 'Rejected') {
+      // "While Rejected, the Charge Point SHALL NOT respond to any Central System initiated
+      // message" and it "MAY for instance close its communication channel": stay offline until
+      // the retry interval has passed, then connect and boot again.
+      void this.#client.reconnectAfter(timerDelay(retryS * 1_000), 'Registration rejected');
+      return;
+    }
+    this.#scheduleBootRetry(retryS);
+  }
+
+  #scheduleBootRetry(seconds: number): void {
+    if (this.#bootRetry) clearTimeout(this.#bootRetry);
+    this.#bootRetry = setTimeout(
+      () => {
+        this.#bootRetry = undefined;
+        if (!this.#stopped && this.#client.isConnected && !this.isRegistered) void this.#boot();
+      },
+      timerDelay(seconds * 1_000),
+    );
   }
 
   #startHeartbeat(): void {
@@ -560,9 +595,10 @@ export class SimulatedCharger extends TypedEventEmitter<SimulatedChargerEvents> 
     );
   }
 
-  #sendAllStatuses(): void {
+  /** @param triggered - requested by TriggerMessage, which is allowed even while Pending */
+  #sendAllStatuses(triggered = false): void {
     this.#sendStationStatus();
-    for (const c of this.#connectors) void this.#sendStatus(c);
+    for (const c of this.#connectors) void this.#sendStatus(c, triggered);
   }
 
   #sendStationStatus(): void {
@@ -597,8 +633,9 @@ export class SimulatedCharger extends TypedEventEmitter<SimulatedChargerEvents> 
     });
   }
 
-  async #sendStatus(c: Connector): Promise<void> {
-    if (!this.#client.isConnected || !this.#registered) return;
+  /** @param triggered - requested by TriggerMessage, which is allowed even while Pending */
+  async #sendStatus(c: Connector, triggered = false): Promise<void> {
+    if (!this.#client.isConnected || (!triggered && !this.isRegistered)) return;
     await this.#call('StatusNotification', {
       connectorId: c.id,
       errorCode: c.errorCode,
@@ -608,7 +645,8 @@ export class SimulatedCharger extends TypedEventEmitter<SimulatedChargerEvents> 
   }
 
   async #authorize(idTag: string): Promise<boolean> {
-    if (!this.#client.isConnected) {
+    // Without an accepted registration the charge point may not send Authorize (section 4.2).
+    if (!this.#client.isConnected || !this.isRegistered) {
       return this.configuration.getBoolean('LocalAuthorizeOffline', true);
     }
     const response = await this.#call('Authorize', { idTag });
@@ -809,7 +847,7 @@ export class SimulatedCharger extends TypedEventEmitter<SimulatedChargerEvents> 
 
   #onStatusChanged(c: Connector, status: ConnectorStatus): void {
     const autopilot = this.#autopilot;
-    if (!autopilot || !this.#registered) return;
+    if (!autopilot || !this.isRegistered) return;
     if (status === 'Available' && !c.plugged && !c.pendingAuth) {
       this.#schedule(c, autopilot.idleS, () => {
         if (c.fsm.status === 'Available' && !c.plugged && !c.pendingAuth) this.plugIn(c.id);
@@ -898,10 +936,12 @@ export class SimulatedCharger extends TypedEventEmitter<SimulatedChargerEvents> 
 
   async #reboot(type: 'Hard' | 'Soft'): Promise<void> {
     this.#rebooting = true;
+    if (this.#bootRetry) clearTimeout(this.#bootRetry);
+    this.#bootRetry = undefined;
     const reason: StopReason = type === 'Hard' ? 'HardReset' : 'SoftReset';
     await Promise.all(this.#connectors.map((c) => this.#stopTransaction(c, reason)));
     this.emit('reboot', type);
-    this.#registered = false;
+    this.#registration = undefined;
     if (this.#heartbeat) clearInterval(this.#heartbeat);
     this.#heartbeat = undefined;
     await this.#client.close(1000, `${type} reset`);
@@ -924,6 +964,8 @@ export class SimulatedCharger extends TypedEventEmitter<SimulatedChargerEvents> 
     const count = this.#connectors.length;
 
     on('RemoteStartTransaction', ({ connectorId, idTag, chargingProfile }) => {
+      // OCPP 1.6 section 4.2: RemoteStart/StopTransaction are not allowed while Pending.
+      if (this.#registration === 'Pending') return { status: 'Rejected' };
       if (chargingProfile && chargingProfile.chargingProfilePurpose !== 'TxProfile') {
         return { status: 'Rejected' };
       }
@@ -963,6 +1005,7 @@ export class SimulatedCharger extends TypedEventEmitter<SimulatedChargerEvents> 
     });
 
     on('RemoteStopTransaction', ({ transactionId }) => {
+      if (this.#registration === 'Pending') return { status: 'Rejected' };
       const c = this.#connectors.find((candidate) => candidate.tx?.id === transactionId);
       if (!c) return { status: 'Rejected' };
       this.#later(0, () => void this.#stopTransaction(c, 'Remote'));
@@ -1046,9 +1089,9 @@ export class SimulatedCharger extends TypedEventEmitter<SimulatedChargerEvents> 
           return { status: 'Accepted' };
         case 'StatusNotification':
           this.#later(0, () => {
-            if (connectorId === undefined) this.#sendAllStatuses();
+            if (connectorId === undefined) this.#sendAllStatuses(true);
             else if (connectorId === 0) this.#sendStationStatus();
-            else for (const c of targets) void this.#sendStatus(c);
+            else for (const c of targets) void this.#sendStatus(c, true);
           });
           return { status: 'Accepted' };
         case 'MeterValues':
