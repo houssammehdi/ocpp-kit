@@ -179,6 +179,7 @@ export function defaultConfiguration(options: {
   const ro = (key: string, value: string, type: ConfigValueType) =>
     ({ key, value, type, readonly: true }) satisfies ConfigKeyDefinition;
   return [
+    rw('AllowOfflineTxForUnknownId', 'false', 'boolean'),
     rw('AuthorizeRemoteTxRequests', 'false', 'boolean'),
     rw('ClockAlignedDataInterval', '0', 'integer', { min: 0 }),
     rw('ConnectionTimeOut', '60', 'integer', { min: 1 }),

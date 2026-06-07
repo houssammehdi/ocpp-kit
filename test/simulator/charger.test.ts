@@ -293,6 +293,30 @@ describe('SimulatedCharger sessions', () => {
     expect(charger.connectors[0]?.status).toBe('Preparing');
   });
 
+  it('offline, accepts an unknown id tag only when AllowOfflineTxForUnknownId is true', async () => {
+    // Regression: LocalAuthorizeOffline (default true) used to accept every tag offline.
+    const { csms, charger } = await started();
+    csms.available = false;
+    await csms.drop();
+    await advance(1);
+    expect(charger.configuration.getBoolean('LocalAuthorizeOffline', false)).toBe(true);
+    charger.plugIn(1, EV);
+    expect(await charger.swipe(1, 'STRANGER')).toBe(false);
+    charger.configuration.set('AllowOfflineTxForUnknownId', 'true');
+    expect(await charger.swipe(1, 'STRANGER')).toBe(true);
+    expect(charger.connectors[0]?.status).toBe('Charging');
+  });
+
+  it('does not start a session when Authorize fails', async () => {
+    const { csms, charger } = await started();
+    csms.handlers.set('Authorize', () => {
+      throw new RpcError('InternalError', 'auth backend down');
+    });
+    charger.plugIn(1, EV);
+    expect(await charger.swipe(1, 'TAG-1')).toBe(false);
+    expect(csms.requestsOf('StartTransaction')).toHaveLength(0);
+  });
+
   it('stops with EVDisconnected when the cable is pulled mid-session', async () => {
     const { csms, charger } = await started();
     await charging(charger);

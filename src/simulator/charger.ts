@@ -646,12 +646,20 @@ export class SimulatedCharger extends TypedEventEmitter<SimulatedChargerEvents> 
 
   async #authorize(idTag: string): Promise<boolean> {
     // Without an accepted registration the charge point may not send Authorize (section 4.2).
-    if (!this.#client.isConnected || !this.isRegistered) {
-      return this.configuration.getBoolean('LocalAuthorizeOffline', true);
-    }
+    if (!this.#client.isConnected || !this.isRegistered) return this.#authorizeUnknownOffline();
     const response = await this.#call('Authorize', { idTag });
-    if (!response) return this.configuration.getBoolean('LocalAuthorizeOffline', true);
+    // No answer (timeout, lost connection, CALLERROR): the Central System is unreachable.
+    if (!response) return this.#authorizeUnknownOffline();
     return response.idTagInfo.status === 'Accepted';
+  }
+
+  /**
+   * Offline decision for an identifier that is not known locally. LocalAuthorizeOffline only
+   * covers identifiers in the Local Authorization List or Authorization Cache; unknown ones are
+   * accepted only when AllowOfflineTxForUnknownId is true (OCPP 1.6 section 3.5.3).
+   */
+  #authorizeUnknownOffline(): boolean {
+    return this.configuration.getBoolean('AllowOfflineTxForUnknownId', false);
   }
 
   /** Authorized but not plugged in yet: wait up to ConnectionTimeOut for the cable. */
