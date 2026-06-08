@@ -1,3 +1,4 @@
+import { randomUUID } from 'node:crypto';
 import {
   CentralSystemToChargePoint,
   ChargePointToCentralSystem,
@@ -5,6 +6,7 @@ import {
   type ChargePointAction,
   type ChargePointRequest,
   type ChargePointResponse,
+  type MeterValue,
   type RegistrationStatus,
 } from '../messages/index.js';
 import type { Duplex } from '../rpc/duplex.js';
@@ -130,6 +132,39 @@ export class NotConnectedError extends OcppKitError {
   }
 }
 
+/**
+ * A MeterValues or StopTransaction of a {@link QueuedTransaction} was abandoned because its
+ * StartTransaction was never delivered, so no transaction id exists to send it with.
+ */
+export class TransactionNotStartedError extends OcppKitError {
+  constructor(
+    readonly transactionRef: string,
+    options?: { cause?: unknown },
+  ) {
+    super(`StartTransaction of transaction ${transactionRef} was not delivered`, options);
+  }
+}
+
+/**
+ * A transaction started with {@link ChargePoint.startTransaction}. Its MeterValues and
+ * StopTransaction can be queued at once, even offline and before the Central System has assigned
+ * a transaction id: the id is filled in when StartTransaction.conf arrives.
+ */
+export interface QueuedTransaction {
+  /** Local reference, stored with every queued message of this transaction. */
+  readonly ref: string;
+  /** The Central System's transaction id, once StartTransaction.conf has arrived. */
+  readonly transactionId: number | undefined;
+  /** Resolves with StartTransaction.conf once delivered; rejects if the start is abandoned. */
+  readonly started: Promise<ChargePointResponse<'StartTransaction'>>;
+  /** Queue MeterValues for this transaction's connector. */
+  meterValues(meterValue: MeterValue[]): Promise<ChargePointResponse<'MeterValues'>>;
+  /** Queue the StopTransaction. Later calls on this handle reject. */
+  stop(
+    request: Omit<ChargePointRequest<'StopTransaction'>, 'transactionId'>,
+  ): Promise<ChargePointResponse<'StopTransaction'>>;
+}
+
 interface Deferred {
   readonly resolve: (value: JsonObject) => void;
   readonly reject: (error: Error) => void;
@@ -163,6 +198,10 @@ export class ChargePoint extends TypedEventEmitter<ChargePointEvents> {
   #registrationStatus: RegistrationStatus | undefined;
   /** Delay of the next reconnect when {@link reconnectAfter} asked for one. */
   #reconnectDelay: number | undefined;
+  /** Transaction ids of {@link QueuedTransaction}s whose StartTransaction has been answered. */
+  readonly #transactionIds = new Map<string, number>();
+  /** References of transactions whose StartTransaction was abandoned. */
+  readonly #failedRefs = new Set<string>();
 
   constructor(options: ChargePointOptions) {
     super();
@@ -260,6 +299,59 @@ export class ChargePoint extends TypedEventEmitter<ChargePointEvents> {
     });
   }
 
+  /**
+   * Start a transaction whose messages all go through the offline queue (see
+   * {@link QueuedTransaction}). Messages are delivered in order and, with a persistent store,
+   * survive restarts: a restarted client fills in the transaction id as soon as it has replayed
+   * the StartTransaction. Without an offline queue the messages are sent directly, each after
+   * StartTransaction.conf has arrived.
+   */
+  startTransaction(request: ChargePointRequest<'StartTransaction'>): QueuedTransaction {
+    const ref = randomUUID();
+    const queued = this.#queue !== undefined;
+    let transactionId: number | undefined;
+    let stopped = false;
+    const started = (
+      queued
+        ? (this.#enqueue('StartTransaction', request, ref) as Promise<
+            ChargePointResponse<'StartTransaction'>
+          >)
+        : this.call('StartTransaction', request)
+    ).then((response) => {
+      transactionId = response.transactionId;
+      return response;
+    });
+    // The caller may never look at `started`; the follow-up calls report failures anyway.
+    started.catch(() => undefined);
+    const follow = (action: 'MeterValues' | 'StopTransaction', payload: JsonObject) => {
+      if (stopped) return Promise.reject(new OcppKitError(`Transaction ${ref} already stopped`));
+      if (action === 'StopTransaction') stopped = true;
+      if (!queued) {
+        return started.then((response) =>
+          this.call(action, { ...payload, transactionId: response.transactionId } as never),
+        );
+      }
+      if (this.#failedRefs.has(ref)) {
+        if (stopped) this.#failedRefs.delete(ref);
+        return Promise.reject(new TransactionNotStartedError(ref));
+      }
+      const known = this.#transactionIds.get(ref);
+      return known === undefined
+        ? this.#enqueue(action, payload, ref)
+        : this.#enqueue(action, { ...payload, transactionId: known }, ref);
+    };
+    return {
+      ref,
+      get transactionId() {
+        return transactionId;
+      },
+      started,
+      meterValues: (meterValue) =>
+        follow('MeterValues', { connectorId: request.connectorId, meterValue }),
+      stop: (stopRequest) => follow('StopTransaction', stopRequest),
+    };
+  }
+
   #onBootResponse(response: ChargePointResponse<'BootNotification'>): void {
     this.#registrationStatus = response.status;
     if (response.status === 'Accepted') void this.#drain();
@@ -295,13 +387,26 @@ export class ChargePoint extends TypedEventEmitter<ChargePointEvents> {
     for (const waiter of this.#connectWaiters.splice(0)) waiter.reject(closed);
   }
 
-  async #enqueue(action: QueuedMessage['action'], payload: JsonObject): Promise<JsonObject> {
+  /**
+   * @param transactionRef - for StartTransaction the reference it defines; for MeterValues and
+   *   StopTransaction the transaction whose id is filled in on delivery if `payload` lacks one
+   */
+  async #enqueue(
+    action: QueuedMessage['action'],
+    payload: JsonObject,
+    transactionRef?: string,
+  ): Promise<JsonObject> {
     const queue = this.#queue;
     if (!queue) throw new OcppKitError('Offline queue disabled');
     if (this.#options.validateOutbound ?? true) {
+      // A payload waiting for its transaction id is checked as if the id were already there.
+      const pending =
+        transactionRef !== undefined &&
+        action !== 'StartTransaction' &&
+        payload.transactionId === undefined;
       const error = validatePayload(
         ChargePointToCentralSystem[action].request,
-        payload,
+        pending ? { ...payload, transactionId: 0 } : payload,
         `${action} request`,
       );
       if (error) throw error;
@@ -310,7 +415,11 @@ export class ChargePoint extends TypedEventEmitter<ChargePointEvents> {
     // Load persisted messages first: saving before that would overwrite them.
     await queue.init();
     if (this.#isStopped()) throw new ConnectionClosedError(1000, 'Client closed');
-    const { message, evicted, persisted } = queue.enqueue(action, payload);
+    const { message, evicted, persisted } = queue.enqueue(
+      action,
+      payload,
+      transactionRef === undefined ? {} : { transactionRef },
+    );
     // Register the waiter synchronously, before the drain loop can possibly deliver the message.
     const delivered = new Promise<JsonObject>((resolve, reject) => {
       this.#deferred.set(message.seq, { resolve, reject });
@@ -347,9 +456,15 @@ export class ChargePoint extends TypedEventEmitter<ChargePointEvents> {
         const peer = this.#peer;
         const head = queue.peek();
         if (!peer?.isOpen || !head || this.#stopped || this.#queueHeld()) return;
+        const payload = this.#payloadFor(head);
+        if (!payload) {
+          // Its StartTransaction was abandoned (or lost from the store): no id to send it with.
+          await this.#settleQueued(head, new TransactionNotStartedError(head.transactionRef ?? ''));
+          continue;
+        }
         queue.setInFlight(head.seq);
         try {
-          const response = await peer.call(head.action, head.payload as never);
+          const response = await peer.call(head.action, payload as never);
           await this.#settleQueued(head, response);
         } catch (error) {
           if (error instanceof ConnectionClosedError) return;
@@ -373,8 +488,53 @@ export class ChargePoint extends TypedEventEmitter<ChargePointEvents> {
     }
   }
 
+  /**
+   * The payload to send for a queued message, with a late-bound transaction id filled in, or
+   * `undefined` when the message waits for a transaction id that will never come.
+   */
+  #payloadFor(message: QueuedMessage): JsonObject | undefined {
+    const ref = message.transactionRef;
+    if (
+      ref === undefined ||
+      message.action === 'StartTransaction' ||
+      message.payload.transactionId !== undefined
+    ) {
+      return message.payload;
+    }
+    const transactionId = this.#transactionIds.get(ref);
+    return transactionId === undefined ? undefined : { ...message.payload, transactionId };
+  }
+
   async #settleQueued(message: QueuedMessage, outcome: JsonObject | Error): Promise<void> {
-    await this.#queue?.remove(message.seq);
+    const queue = this.#queue;
+    const ref = message.transactionRef;
+    if (message.action === 'StartTransaction' && ref !== undefined) {
+      if (outcome instanceof Error) {
+        this.#failedRefs.add(ref);
+        await queue?.remove(message.seq);
+        this.#finish(message, outcome);
+        for (const dependent of (await queue?.removeDependents(ref)) ?? []) {
+          this.#finish(dependent, new TransactionNotStartedError(ref, { cause: outcome }));
+        }
+        return;
+      }
+      const { transactionId } = outcome as ChargePointResponse<'StartTransaction'>;
+      // Record the id before anything else can run, so a MeterValues queued from now on is
+      // created with it; completeStart() rewrites the ones already queued.
+      this.#transactionIds.set(ref, transactionId);
+      await queue?.completeStart(message.seq, ref, transactionId);
+    } else {
+      await queue?.remove(message.seq);
+      if (message.action === 'StopTransaction' && ref !== undefined) {
+        this.#transactionIds.delete(ref);
+        this.#failedRefs.delete(ref);
+      }
+    }
+    this.#finish(message, outcome);
+  }
+
+  /** Settle the caller's promise of a queued message and report the outcome. */
+  #finish(message: QueuedMessage, outcome: JsonObject | Error): void {
     this.#attempts.delete(message.seq);
     const deferred = this.#deferred.get(message.seq);
     this.#deferred.delete(message.seq);

@@ -12,6 +12,13 @@ export interface QueuedMessage {
   readonly payload: JsonObject;
   /** ISO timestamp of when the message was queued. */
   readonly enqueuedAt: string;
+  /**
+   * Local reference of a transaction started through `ChargePoint.startTransaction()`. On a
+   * StartTransaction it names the transaction the message starts. On MeterValues and
+   * StopTransaction it names the transaction they belong to: while their payload has no
+   * `transactionId`, it is filled in once that StartTransaction has been answered.
+   */
+  readonly transactionRef?: string;
 }
 
 /** Persistence backend of an {@link OfflineQueue}. */
@@ -172,7 +179,11 @@ export class OfflineQueue {
    *
    * @throws {@link OfflineQueueFullError} when full and no MeterValues can be evicted
    */
-  enqueue(action: QueuedMessage['action'], payload: JsonObject): QueueInsertion {
+  enqueue(
+    action: QueuedMessage['action'],
+    payload: JsonObject,
+    options: { readonly transactionRef?: string } = {},
+  ): QueueInsertion {
     if (!this.#loaded) throw new OcppKitError('OfflineQueue.init() must complete before enqueue()');
     let evicted: QueuedMessage | undefined;
     if (this.#messages.length >= this.#maxSize) {
@@ -187,6 +198,7 @@ export class OfflineQueue {
       action,
       payload,
       enqueuedAt: new Date().toISOString(),
+      ...(options.transactionRef === undefined ? {} : { transactionRef: options.transactionRef }),
     };
     this.#messages.push(message);
     const persisted = this.#store.save(this.#messages);
@@ -197,11 +209,50 @@ export class OfflineQueue {
   async push(
     action: QueuedMessage['action'],
     payload: JsonObject,
+    options: { readonly transactionRef?: string } = {},
   ): Promise<{ message: QueuedMessage; evicted?: QueuedMessage }> {
     await this.init();
-    const { persisted, ...inserted } = this.enqueue(action, payload);
+    const { persisted, ...inserted } = this.enqueue(action, payload, options);
     await persisted;
     return inserted;
+  }
+
+  /**
+   * Remove a delivered StartTransaction and fill `transactionId` into every queued message that
+   * waits for it, persisting both changes in one save. The rewrite happens synchronously, before
+   * the returned promise is awaited.
+   *
+   * @returns the number of messages that received the transaction id
+   */
+  async completeStart(seq: number, transactionRef: string, transactionId: number): Promise<number> {
+    let bound = 0;
+    this.#messages = this.#messages
+      .filter((m) => m.seq !== seq)
+      .map((m) => {
+        if (m.transactionRef !== transactionRef || m.action === 'StartTransaction') return m;
+        bound++;
+        // The reference stays, so the client still knows which transaction a StopTransaction
+        // ends once it is delivered.
+        return { ...m, payload: { ...m.payload, transactionId } };
+      });
+    await this.#store.save(this.#messages);
+    return bound;
+  }
+
+  /**
+   * Remove every MeterValues/StopTransaction that waits for `transactionRef`, e.g. because its
+   * StartTransaction was abandoned.
+   *
+   * @returns the removed messages
+   */
+  async removeDependents(transactionRef: string): Promise<QueuedMessage[]> {
+    const removed = this.#messages.filter(
+      (m) => m.transactionRef === transactionRef && m.action !== 'StartTransaction',
+    );
+    if (removed.length === 0) return [];
+    this.#messages = this.#messages.filter((m) => !removed.includes(m));
+    await this.#store.save(this.#messages);
+    return removed;
   }
 
   /** Remove a delivered (or abandoned) message and persist the queue. */

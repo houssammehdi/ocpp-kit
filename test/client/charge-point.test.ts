@@ -4,6 +4,7 @@ import {
   MemoryQueueStore,
   NotConnectedError,
   RpcError,
+  TransactionNotStartedError,
   type ChargePointOptions,
   type QueuedMessage,
 } from '../../src/index.js';
@@ -422,5 +423,122 @@ describe('ChargePoint offline queue', () => {
     await cp.connect();
     await expect(cp.call('StartTransaction', start)).resolves.toMatchObject({ transactionId: 100 });
     expect(csms.received).toEqual(['StartTransaction']);
+  });
+});
+
+describe('ChargePoint.startTransaction', () => {
+  const reading = (wh: number) => [{ timestamp: NOW, sampledValue: [{ value: String(wh) }] }];
+
+  it('queues MeterValues and StopTransaction before the transaction id is known', async () => {
+    const { csms, cp } = setup();
+    csms.available = false;
+    void cp.connect();
+    await nextEvent(cp, 'reconnecting');
+
+    const tx = cp.startTransaction(start);
+    expect(tx.transactionId).toBeUndefined();
+    const sampled = [tx.meterValues(reading(100)), tx.meterValues(reading(200))];
+    const stopped = tx.stop({ meterStop: 300, timestamp: NOW, reason: 'Local' });
+    await until(() => cp.queueSize === 4);
+
+    csms.available = true;
+    await expect(tx.started).resolves.toMatchObject({ transactionId: 100 });
+    await Promise.all([...sampled, stopped]);
+    expect(tx.transactionId).toBe(100);
+    expect(csms.received).toEqual([
+      'BootNotification',
+      'StartTransaction',
+      'MeterValues',
+      'MeterValues',
+      'StopTransaction',
+    ]);
+    expect(csms.requestsOf('MeterValues').map((r) => r.transactionId)).toEqual([100, 100]);
+    expect(csms.requestsOf('StopTransaction')[0]).toMatchObject({
+      transactionId: 100,
+      meterStop: 300,
+    });
+    await expect(tx.meterValues(reading(400))).rejects.toThrow(/already stopped/);
+  });
+
+  it('uses the known id directly once the start has been answered', async () => {
+    const { csms, cp } = setup();
+    await cp.connect();
+    const tx = cp.startTransaction(start);
+    await tx.started;
+    await tx.meterValues(reading(1));
+    await tx.stop({ meterStop: 2, timestamp: NOW });
+    expect(csms.requestsOf('MeterValues')[0]).toMatchObject({ connectorId: 1, transactionId: 100 });
+    expect(csms.requestsOf('StopTransaction')[0]).toMatchObject({ transactionId: 100 });
+  });
+
+  it('binds the id after a restart from a persisted store', async () => {
+    const store = new MemoryQueueStore();
+    const first = setup({ offlineQueue: { store } });
+    first.csms.available = false;
+    const connecting = first.cp.connect().catch(() => undefined);
+    await nextEvent(first.cp, 'reconnecting');
+    const tx = first.cp.startTransaction(start);
+    void tx.meterValues(reading(5)).catch(() => undefined);
+    void tx.stop({ meterStop: 10, timestamp: NOW }).catch(() => undefined);
+    await until(() => first.cp.queueSize === 3);
+    await first.cp.close();
+    await connecting;
+    const persisted = await store.load();
+    expect(persisted.map((m) => [m.action, m.payload.transactionId])).toEqual([
+      ['StartTransaction', undefined],
+      ['MeterValues', undefined],
+      ['StopTransaction', undefined],
+    ]);
+
+    // A new client instance knows nothing about the handle; the store is enough.
+    const second = setup({ offlineQueue: { store } });
+    const delivered: string[] = [];
+    second.cp.on('delivered', (message) => delivered.push(message.action));
+    await second.cp.connect();
+    await until(() => delivered.length === 3);
+    expect(second.csms.requestsOf('MeterValues')[0]).toMatchObject({ transactionId: 100 });
+    expect(second.csms.requestsOf('StopTransaction')[0]).toMatchObject({ transactionId: 100 });
+    expect(await store.load()).toEqual([]);
+  });
+
+  it('abandons the follow-up messages when the start is abandoned', async () => {
+    const { csms, cp } = setup({ transactionMessageAttempts: 2 });
+    csms.handlers.set('StartTransaction', () => {
+      throw new RpcError('InternalError', 'db down');
+    });
+    const dropped: string[] = [];
+    cp.on('dropped', (message) => dropped.push(message.action));
+    await cp.connect();
+    const tx = cp.startTransaction(start);
+    const sampled = tx.meterValues(reading(1));
+    const stopped = tx.stop({ meterStop: 2, timestamp: NOW });
+    await expect(tx.started).rejects.toMatchObject({ code: 'InternalError' });
+    await expect(sampled).rejects.toBeInstanceOf(TransactionNotStartedError);
+    await expect(stopped).rejects.toBeInstanceOf(TransactionNotStartedError);
+    expect(dropped).toEqual(['StartTransaction', 'MeterValues', 'StopTransaction']);
+    expect(csms.received.filter((a) => a !== 'BootNotification')).toEqual([
+      'StartTransaction',
+      'StartTransaction',
+    ]);
+    expect(cp.queueSize).toBe(0);
+  });
+
+  it('validates follow-up messages as if the id were already known', async () => {
+    const { cp } = setup();
+    const tx = cp.startTransaction(start);
+    // @ts-expect-error -- meterStop is required
+    await expect(tx.stop({ timestamp: NOW })).rejects.toMatchObject({
+      code: 'OccurenceConstraintViolation',
+    });
+  });
+
+  it('chains on the StartTransaction response when the queue is disabled', async () => {
+    const { csms, cp } = setup({ offlineQueue: false, autoBoot: false });
+    await cp.connect();
+    const tx = cp.startTransaction(start);
+    await tx.meterValues(reading(1));
+    await tx.stop({ meterStop: 2, timestamp: NOW });
+    expect(csms.received).toEqual(['StartTransaction', 'MeterValues', 'StopTransaction']);
+    expect(csms.requestsOf('StopTransaction')[0]).toMatchObject({ transactionId: 100 });
   });
 });
