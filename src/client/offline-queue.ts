@@ -74,6 +74,16 @@ export class FileQueueStore implements OfflineQueueStore {
   }
 }
 
+/** Result of {@link OfflineQueue.enqueue}. */
+export interface QueueInsertion {
+  /** The queued message. */
+  readonly message: QueuedMessage;
+  /** A MeterValues message discarded to make room, if any. */
+  readonly evicted?: QueuedMessage;
+  /** Settles once the store has saved the queue including the new message. */
+  readonly persisted: Promise<void>;
+}
+
 /** The queue is full and the new message may not displace an older one. */
 export class OfflineQueueFullError extends OcppKitError {
   constructor(readonly maxSize: number) {
@@ -93,6 +103,7 @@ export class OfflineQueue {
   readonly #maxSize: number;
   #messages: QueuedMessage[] = [];
   #nextSeq = 1;
+  #loading: Promise<void> | undefined;
   #loaded = false;
   #inFlight: number | undefined;
 
@@ -106,11 +117,18 @@ export class OfflineQueue {
     return this.#messages.length;
   }
 
-  /** Load persisted messages. Idempotent. */
-  async init(): Promise<void> {
-    if (this.#loaded) return;
+  /**
+   * Load persisted messages. Idempotent; {@link push} calls it too, so nothing is ever saved
+   * before the persisted contents are known.
+   */
+  init(): Promise<void> {
+    this.#loading ??= this.#load();
+    return this.#loading;
+  }
+
+  async #load(): Promise<void> {
     const loaded = await this.#store.load();
-    this.#messages = [...loaded, ...this.#messages].sort((a, b) => a.seq - b.seq);
+    this.#messages = [...loaded].sort((a, b) => a.seq - b.seq);
     // A loop rather than Math.max(...seqs): spreading a few hundred thousand arguments throws
     // a RangeError, which would make a large persisted queue impossible to restore.
     for (const message of this.#messages) {
@@ -137,11 +155,25 @@ export class OfflineQueue {
     this.#inFlight = seq;
   }
 
-  /** Append a message and persist the queue. Returns the discarded message, if any. */
-  async push(
-    action: QueuedMessage['action'],
-    payload: JsonObject,
-  ): Promise<{ message: QueuedMessage; evicted?: QueuedMessage }> {
+  /** Sequence number of the message marked with {@link setInFlight}, if any. */
+  get inFlight(): number | undefined {
+    return this.#inFlight;
+  }
+
+  /** Whether {@link init} has completed, i.e. the persisted messages are loaded. */
+  get isLoaded(): boolean {
+    return this.#loaded;
+  }
+
+  /**
+   * Append a message synchronously (after {@link init} has completed) and start persisting the
+   * queue. Use it when the caller must know the sequence number before anything else can run;
+   * otherwise prefer {@link push}.
+   *
+   * @throws {@link OfflineQueueFullError} when full and no MeterValues can be evicted
+   */
+  enqueue(action: QueuedMessage['action'], payload: JsonObject): QueueInsertion {
+    if (!this.#loaded) throw new OcppKitError('OfflineQueue.init() must complete before enqueue()');
     let evicted: QueuedMessage | undefined;
     if (this.#messages.length >= this.#maxSize) {
       const index = this.#messages.findIndex(
@@ -157,8 +189,19 @@ export class OfflineQueue {
       enqueuedAt: new Date().toISOString(),
     };
     this.#messages.push(message);
-    await this.#store.save(this.#messages);
-    return evicted ? { message, evicted } : { message };
+    const persisted = this.#store.save(this.#messages);
+    return evicted ? { message, evicted, persisted } : { message, persisted };
+  }
+
+  /** Append a message and persist the queue. Returns the discarded message, if any. */
+  async push(
+    action: QueuedMessage['action'],
+    payload: JsonObject,
+  ): Promise<{ message: QueuedMessage; evicted?: QueuedMessage }> {
+    await this.init();
+    const { persisted, ...inserted } = this.enqueue(action, payload);
+    await persisted;
+    return inserted;
   }
 
   /** Remove a delivered (or abandoned) message and persist the queue. */

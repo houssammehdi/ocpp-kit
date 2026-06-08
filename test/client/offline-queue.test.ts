@@ -93,6 +93,30 @@ describe('OfflineQueue', () => {
     expect(message.seq).toBe(count + 1);
   });
 
+  it('loads the store before the first push instead of overwriting it', async () => {
+    // Regression: pushing before init() saved a queue without the persisted messages.
+    const store = new MemoryQueueStore();
+    await store.save([{ seq: 1, action: 'StopTransaction', payload: { n: 1 }, enqueuedAt: 'x' }]);
+    const queue = new OfflineQueue(store);
+    const { message } = await queue.push('StartTransaction', { n: 2 });
+    expect(message.seq).toBe(2);
+    expect((await store.load()).map((m) => m.seq)).toEqual([1, 2]);
+    await queue.init();
+    expect(queue.list().map((m) => m.seq)).toEqual([1, 2]);
+  });
+
+  it('enqueues synchronously once loaded', async () => {
+    const queue = new OfflineQueue();
+    expect(queue.isLoaded).toBe(false);
+    expect(() => queue.enqueue('MeterValues', meter(1))).toThrow(/init/);
+    await queue.init();
+    const first = queue.enqueue('MeterValues', meter(1));
+    const second = queue.enqueue('MeterValues', meter(2));
+    expect([first.message.seq, second.message.seq]).toEqual([1, 2]);
+    await Promise.all([first.persisted, second.persisted]);
+    expect(queue.size).toBe(2);
+  });
+
   it('treats a missing file as empty and rejects corrupt files', async () => {
     const dir = await mkdtemp(join(tmpdir(), 'ocpp-kit-'));
     dirs.push(dir);

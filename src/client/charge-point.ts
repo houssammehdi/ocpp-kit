@@ -307,16 +307,31 @@ export class ChargePoint extends TypedEventEmitter<ChargePointEvents> {
       if (error) throw error;
     }
     if (this.#stopped) throw new ConnectionClosedError(1000, 'Client closed');
-    const { message, evicted } = await queue.push(action, payload);
+    // Load persisted messages first: saving before that would overwrite them.
+    await queue.init();
+    if (this.#isStopped()) throw new ConnectionClosedError(1000, 'Client closed');
+    const { message, evicted, persisted } = queue.enqueue(action, payload);
+    // Register the waiter synchronously, before the drain loop can possibly deliver the message.
+    const delivered = new Promise<JsonObject>((resolve, reject) => {
+      this.#deferred.set(message.seq, { resolve, reject });
+    });
     if (evicted) {
       const error = new OcppKitError('Evicted from a full offline queue');
       this.#deferred.get(evicted.seq)?.reject(error);
       this.#deferred.delete(evicted.seq);
       this.emit('dropped', evicted, error);
     }
-    const delivered = new Promise<JsonObject>((resolve, reject) => {
-      this.#deferred.set(message.seq, { resolve, reject });
-    });
+    try {
+      await persisted;
+    } catch (error) {
+      // The store could not save it: tell the caller, and do not deliver a message the caller
+      // was told failed (unless it is already on the wire; then its outcome settles the promise).
+      if (queue.inFlight !== message.seq) {
+        this.#deferred.delete(message.seq);
+        await queue.remove(message.seq).catch(() => undefined);
+        throw error;
+      }
+    }
     void this.#drain();
     return delivered;
   }

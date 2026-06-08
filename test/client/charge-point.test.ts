@@ -392,6 +392,20 @@ describe('ChargePoint offline queue', () => {
     ]);
   });
 
+  it('keeps persisted messages when a message is queued before connect()', async () => {
+    // Regression: the early push overwrote the store, losing a persisted StopTransaction, and
+    // reused its sequence number.
+    const store = new MemoryQueueStore();
+    await store.save([{ seq: 1, action: 'StopTransaction', payload: stop(7), enqueuedAt: NOW }]);
+    const { csms, cp } = setup({ offlineQueue: { store } });
+    const started = cp.call('StartTransaction', start);
+    await cp.connect();
+    await expect(started).resolves.toMatchObject({ transactionId: 100 });
+    expect(csms.received).toEqual(['BootNotification', 'StopTransaction', 'StartTransaction']);
+    expect(csms.requestsOf('StopTransaction')[0]).toMatchObject({ transactionId: 7 });
+    expect(await store.load()).toEqual([]);
+  });
+
   it('keeps the registration across reconnects of the same client', async () => {
     const { csms, cp } = setup();
     await cp.connect();
