@@ -73,14 +73,20 @@ export interface ChargePointOptions {
   readonly offlineQueue?: OfflineQueueOptions | false;
   /**
    * Attempts per transaction message when the Central System answers with CALLERROR or does not
-   * answer in time (`TransactionMessageAttempts`). Connection loss does not count. Default: 3.
+   * answer in time (`TransactionMessageAttempts`). Connection loss does not count. A function is
+   * read before every message, so configuration changes apply at once. Default: 3.
    */
-  readonly transactionMessageAttempts?: number;
+  readonly transactionMessageAttempts?: number | (() => number);
   /**
    * Base wait between attempts; attempt `n` waits `n` times this value
-   * (`TransactionMessageRetryInterval`). Default: 5 000 ms.
+   * (`TransactionMessageRetryInterval`). A function is read before every wait. Default: 5 000 ms.
    */
-  readonly transactionMessageRetryIntervalMs?: number;
+  readonly transactionMessageRetryIntervalMs?: number | (() => number);
+  /**
+   * Send a WebSocket ping this often and drop the connection when the previous ping got no pong
+   * (OCPP 1.6 `WebSocketPingInterval`). 0 disables client-side pings. Default: 0.
+   */
+  readonly pingIntervalMs?: number;
   /** Uniform random source used for backoff jitter. Default: `Math.random`. */
   readonly random?: () => number;
   /** Transport factory. Default: `ws` WebSocket connector. */
@@ -449,8 +455,8 @@ export class ChargePoint extends TypedEventEmitter<ChargePointEvents> {
     const queue = this.#queue;
     if (!queue || this.#draining) return;
     this.#draining = true;
-    const maxAttempts = this.#options.transactionMessageAttempts ?? 3;
-    const retryInterval = this.#options.transactionMessageRetryIntervalMs ?? 5_000;
+    const setting = (value: number | (() => number) | undefined, fallback: number): number =>
+      typeof value === 'function' ? value() : (value ?? fallback);
     try {
       for (;;) {
         const peer = this.#peer;
@@ -470,13 +476,14 @@ export class ChargePoint extends TypedEventEmitter<ChargePointEvents> {
           if (error instanceof ConnectionClosedError) return;
           const attempts = (this.#attempts.get(head.seq) ?? 0) + 1;
           const retryable = error instanceof RpcError || error instanceof CallTimeoutError;
-          if (!retryable || attempts >= maxAttempts) {
+          if (!retryable || attempts >= setting(this.#options.transactionMessageAttempts, 3)) {
             await this.#settleQueued(
               head,
               error instanceof Error ? error : new Error(String(error)),
             );
           } else {
             this.#attempts.set(head.seq, attempts);
+            const retryInterval = setting(this.#options.transactionMessageRetryIntervalMs, 5_000);
             await this.#sleep(retryInterval * attempts);
           }
         } finally {
@@ -614,6 +621,7 @@ export class ChargePoint extends TypedEventEmitter<ChargePointEvents> {
           protocols: [OCPP16_SUBPROTOCOL],
           headers,
           handshakeTimeoutMs: this.#options.handshakeTimeoutMs ?? 10_000,
+          pingIntervalMs: this.#options.pingIntervalMs ?? 0,
         });
       } catch (error) {
         failures++;

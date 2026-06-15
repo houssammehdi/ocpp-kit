@@ -309,6 +309,26 @@ describe('ChargePoint offline queue', () => {
     expect(delivered).toEqual([1, 3]);
   });
 
+  it('reads retry settings given as functions before every message', async () => {
+    let attempts = 2;
+    const { csms, cp } = setup({ transactionMessageAttempts: () => attempts });
+    let calls = 0;
+    csms.handlers.set('MeterValues', () => {
+      calls++;
+      throw new RpcError('InternalError');
+    });
+    await cp.connect();
+    await expect(cp.call('MeterValues', meter(1, 1))).rejects.toMatchObject({
+      code: 'InternalError',
+    });
+    expect(calls).toBe(2);
+    attempts = 4;
+    await expect(cp.call('MeterValues', meter(1, 2))).rejects.toMatchObject({
+      code: 'InternalError',
+    });
+    expect(calls).toBe(6);
+  });
+
   it('recovers when a later attempt succeeds', async () => {
     const { csms, cp } = setup();
     let calls = 0;

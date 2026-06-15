@@ -13,6 +13,11 @@ export interface ConnectRequest {
   /** Extra HTTP headers for the handshake, e.g. `Authorization`. */
   readonly headers: Readonly<Record<string, string>>;
   readonly handshakeTimeoutMs: number;
+  /**
+   * Keep-alive: send a WebSocket ping this often and drop the connection (code 1006) when the
+   * previous ping was not answered. 0 or absent disables pings.
+   */
+  readonly pingIntervalMs?: number;
 }
 
 /**
@@ -30,6 +35,26 @@ export class HandshakeError extends OcppKitError {
   ) {
     super(message);
   }
+}
+
+/** Ping `ws` every `intervalMs`; terminate it when a ping is still unanswered at the next one. */
+function keepAlive(ws: WebSocket, intervalMs: number): void {
+  if (!(intervalMs > 0)) return;
+  let answered = true;
+  ws.on('pong', () => {
+    answered = true;
+  });
+  const timer = setInterval(() => {
+    if (!answered) {
+      ws.terminate();
+      return;
+    }
+    answered = false;
+    ws.ping();
+  }, timerDelay(intervalMs));
+  ws.once('close', () => {
+    clearInterval(timer);
+  });
 }
 
 /** Default {@link Connector} based on the `ws` package. */
@@ -63,6 +88,7 @@ export const webSocketConnector: Connector = (request) =>
         return;
       }
       settled = true;
+      keepAlive(ws, request.pingIntervalMs ?? 0);
       resolve(webSocketDuplex(ws));
     });
   });
