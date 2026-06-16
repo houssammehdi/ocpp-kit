@@ -4,6 +4,7 @@ export * from './configuration.js';
 export * from './metering.js';
 export * from './authorization.js';
 export * from './reservations.js';
+export * from './firmware.js';
 export * from './ev.js';
 export * from './smart-charging.js';
 export * from './stats.js';
