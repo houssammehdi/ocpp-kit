@@ -2,6 +2,7 @@ export * from './random.js';
 export * from './connector-state.js';
 export * from './configuration.js';
 export * from './metering.js';
+export * from './authorization.js';
 export * from './ev.js';
 export * from './smart-charging.js';
 export * from './stats.js';
