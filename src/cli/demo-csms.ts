@@ -117,7 +117,9 @@ export class DemoCsms {
     });
     this.cs.handle('Heartbeat', () => ({ currentTime: new Date().toISOString() }));
     this.cs.handle('Authorize', () => ({ idTagInfo: { status: 'Accepted' } }));
-    this.cs.handle('DataTransfer', () => ({ status: 'Accepted' }));
+    // OCPP 1.6 section 4.3: without an implementation for the vendorId the answer SHALL be
+    // UnknownVendorId. The demo has no vendor extensions.
+    this.cs.handle('DataTransfer', () => ({ status: 'UnknownVendorId' }));
     this.cs.handle('StatusNotification', ({ connectorId, status }, { connection }) => {
       if (connectorId > 0) this.#connector(connection.identity, connectorId).status = status;
       return {};

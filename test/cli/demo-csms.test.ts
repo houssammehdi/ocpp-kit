@@ -1,7 +1,7 @@
 import { afterEach, describe, expect, it } from 'vitest';
 import { executeCommand, renderStations } from '../../src/cli/csms.js';
 import { DemoCsms } from '../../src/cli/demo-csms.js';
-import { HandshakeError, SimulatedCharger } from '../../src/index.js';
+import { ChargePoint, HandshakeError, SimulatedCharger } from '../../src/index.js';
 import { until } from '../helpers.js';
 
 const cleanups: (() => Promise<unknown>)[] = [];
@@ -93,6 +93,17 @@ describe('demo CSMS', () => {
     expect((await executeCommand(csms, 'reset DEMO-1 hard')).output).toBe(
       'Reset DEMO-1 (Hard): Accepted',
     );
+  });
+
+  it('answers DataTransfer for unknown vendors with UnknownVendorId', async () => {
+    // Regression: the demo used to answer Accepted, which section 4.3 does not allow.
+    const { url } = await setup();
+    const cp = new ChargePoint({ identity: 'VENDOR-TEST', url, password: 'pw', reconnect: false });
+    cleanups.push(() => cp.close());
+    await cp.connect();
+    await expect(cp.call('DataTransfer', { vendorId: 'com.example' })).resolves.toEqual({
+      status: 'UnknownVendorId',
+    });
   });
 
   it('refuses charge points with the wrong password', async () => {
