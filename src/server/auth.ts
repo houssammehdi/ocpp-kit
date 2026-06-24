@@ -1,4 +1,5 @@
 import type { IncomingMessage } from 'node:http';
+import type { PeerCertificate } from 'node:tls';
 
 /** Credentials extracted from an HTTP `Authorization: Basic ...` header. */
 export interface BasicCredentials {
@@ -35,8 +36,13 @@ export interface AuthenticationRequest {
    * identity). `undefined` when no valid Basic credentials for this identity were sent.
    */
   readonly password: string | undefined;
-  /** The raw upgrade request, e.g. to inspect the remote address or client certificate. */
+  /** The raw upgrade request, e.g. to inspect the remote address or headers. */
   readonly request: IncomingMessage;
+  /**
+   * The charge point's TLS client certificate, when `clientCertificates` is configured and the
+   * certificate was verified (trusted and matching the identity).
+   */
+  readonly certificate?: PeerCertificate;
 }
 
 /** Decide whether a charge point may connect. Throwing counts as a rejection. */

@@ -25,7 +25,7 @@ import { OCPP16_SUBPROTOCOL } from '../transport/websocket.js';
 import { TypedEventEmitter } from '../util/typed-emitter.js';
 import { timerDelay } from '../util/timers.js';
 import { backoffDelay, DEFAULT_BACKOFF, type BackoffOptions } from './backoff.js';
-import { webSocketConnector, type Connector } from './connector.js';
+import { webSocketConnector, type ChargePointTlsOptions, type Connector } from './connector.js';
 import {
   MemoryQueueStore,
   OfflineQueue,
@@ -58,8 +58,13 @@ export interface ChargePointOptions {
   readonly identity: string;
   /** Central System endpoint without the identity, e.g. `ws://localhost:9220/ocpp`. */
   readonly url: string;
-  /** Security Profile 1 password (HTTP Basic auth with the identity as username). */
+  /**
+   * Password for HTTP Basic auth with the identity as username (Security Profile 1 over `ws://`,
+   * Security Profile 2 over `wss://`).
+   */
   readonly password?: string;
+  /** TLS settings for `wss://` URLs: CA pinning and, for Security Profile 3, a client cert. */
+  readonly tls?: ChargePointTlsOptions;
   /** Default CALL timeout. Default: 30 000 ms. */
   readonly callTimeoutMs?: number;
   /** WebSocket handshake timeout. Default: 10 000 ms. */
@@ -622,6 +627,7 @@ export class ChargePoint extends TypedEventEmitter<ChargePointEvents> {
           headers,
           handshakeTimeoutMs: this.#options.handshakeTimeoutMs ?? 10_000,
           pingIntervalMs: this.#options.pingIntervalMs ?? 0,
+          ...(this.#options.tls === undefined ? {} : { tls: this.#options.tls }),
         });
       } catch (error) {
         failures++;

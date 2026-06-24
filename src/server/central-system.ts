@@ -1,7 +1,8 @@
-import { createServer, type IncomingMessage, type Server } from 'node:http';
-import type { Server as HttpsServer } from 'node:https';
+import { createServer, type IncomingMessage, type Server, type ServerResponse } from 'node:http';
+import { createServer as createHttpsServer, type Server as HttpsServer } from 'node:https';
 import type { AddressInfo } from 'node:net';
 import type { Duplex as NodeDuplex } from 'node:stream';
+import type { PeerCertificate, SecureVersion, TLSSocket } from 'node:tls';
 import { WebSocketServer, type WebSocket } from 'ws';
 import type { CentralSystemToChargePoint, ChargePointToCentralSystem } from '../messages/index.js';
 import { RpcError } from '../rpc/errors.js';
@@ -12,10 +13,51 @@ import { OCPP16_SUBPROTOCOL } from '../transport/websocket.js';
 import { TypedEventEmitter } from '../util/typed-emitter.js';
 import { timerDelay } from '../util/timers.js';
 import { parseBasicAuth, type Authenticator } from './auth.js';
+import { certificateMatchesIdentity, type CertificateIdentityBinding } from './certificates.js';
 import { ChargePointConnection, type CentralSystemHandlerContext } from './connection.js';
 
 type Inbound = typeof ChargePointToCentralSystem;
 type Outbound = typeof CentralSystemToChargePoint;
+
+/** PEM material: one item or several (e.g. a certificate chain or several CAs). */
+export type PemInput = string | Buffer | readonly (string | Buffer)[];
+
+/**
+ * TLS server settings for Security Profiles 2 and 3 (`wss://`). {@link CentralSystem.listen}
+ * then creates an HTTPS server.
+ */
+export interface CentralSystemTlsOptions {
+  /** Server certificate, optionally followed by intermediates (PEM). */
+  readonly cert: PemInput;
+  /** Private key of the server certificate (PEM). */
+  readonly key: string | Buffer;
+  /** Passphrase of an encrypted key. */
+  readonly passphrase?: string;
+  /** CAs that sign charge point certificates (Security Profile 3). */
+  readonly ca?: PemInput;
+  /**
+   * Oldest accepted TLS version. Default: `TLSv1.2`, the minimum the OCPP 1.6 security
+   * whitepaper allows.
+   */
+  readonly minVersion?: SecureVersion;
+  /** OpenSSL cipher list, when the defaults must be narrowed. */
+  readonly ciphers?: string;
+}
+
+/** Client certificate checks for Security Profile 3 (TLS with client certificates). */
+export interface ClientCertificateOptions {
+  /**
+   * Refuse charge points that present no certificate. With `false`, a charge point without a
+   * certificate may still connect (e.g. with Basic auth, Security Profile 2), but one that
+   * presents an untrusted or mismatching certificate is refused. Default: true.
+   */
+  readonly required?: boolean;
+  /**
+   * How the identity in the URL must match the certificate, or `false` to accept any trusted
+   * certificate for any identity. Default: `'cn-or-san'`.
+   */
+  readonly identityBinding?: CertificateIdentityBinding | false;
+}
 
 /** Options of {@link CentralSystem}. */
 export interface CentralSystemOptions {
@@ -24,8 +66,19 @@ export interface CentralSystemOptions {
    * with `basePath: '/ocpp'` a charge point connects to `ws://host/ocpp/CP-001`. Default: `/`.
    */
   readonly basePath?: string;
-  /** Authentication hook for OCPP Security Profile 1 (HTTP Basic auth). Default: accept all. */
+  /**
+   * Authentication hook for HTTP Basic auth (Security Profiles 1 and 2). It also sees the
+   * verified client certificate, if any. Default: accept all.
+   */
   readonly authenticate?: Authenticator;
+  /** Serve `wss://` with this certificate (Security Profiles 2 and 3). */
+  readonly tls?: CentralSystemTlsOptions;
+  /**
+   * Request and verify client certificates (Security Profile 3). The certificate must chain to
+   * `tls.ca` (or, for {@link CentralSystem.attach}, to the CAs of your HTTPS server, which must
+   * set `requestCert`) and match the identity.
+   */
+  readonly clientCertificates?: ClientCertificateOptions;
   /** Default timeout for CALLs sent to charge points. Default: 30 000 ms. */
   readonly callTimeoutMs?: number;
   /**
@@ -54,7 +107,8 @@ export interface CentralSystemOptions {
 }
 
 /** Why a connection attempt was refused. */
-export type RejectionReason = 'path' | 'auth' | 'subprotocol' | 'duplicate' | 'shutdown';
+export type RejectionReason =
+  'path' | 'auth' | 'certificate' | 'subprotocol' | 'duplicate' | 'shutdown';
 
 /** Emitted after an inbound CALL from a charge point was answered. */
 export interface CentralSystemCallEvent {
@@ -78,6 +132,8 @@ export interface CentralSystemEvents {
     readonly reason: RejectionReason;
     readonly identity: string | undefined;
     readonly remoteAddress: string | undefined;
+    /** Why, when there is more to say than the reason (e.g. which certificate check failed). */
+    readonly detail?: string;
   }) => void;
   badMessage: (connection: ChargePointConnection, raw: string, error: RpcError) => void;
 }
@@ -129,8 +185,10 @@ function refuse(socket: NodeDuplex, status: number, message: string, headers: st
  * ```
  */
 export class CentralSystem extends TypedEventEmitter<CentralSystemEvents> {
-  readonly #options: Required<Omit<CentralSystemOptions, 'authenticate'>> &
-    Pick<CentralSystemOptions, 'authenticate'>;
+  readonly #options: Required<
+    Omit<CentralSystemOptions, 'authenticate' | 'tls' | 'clientCertificates'>
+  > &
+    Pick<CentralSystemOptions, 'authenticate' | 'tls' | 'clientCertificates'>;
   readonly #handlers = new HandlerRegistry<Inbound, CentralSystemHandlerContext>();
   readonly #connections = new Map<string, ChargePointConnection>();
   readonly #wss: WebSocketServer;
@@ -146,6 +204,8 @@ export class CentralSystem extends TypedEventEmitter<CentralSystemEvents> {
     this.#options = {
       basePath: normaliseBasePath(options.basePath ?? DEFAULTS.basePath),
       authenticate: options.authenticate,
+      tls: options.tls,
+      clientCertificates: options.clientCertificates,
       callTimeoutMs: options.callTimeoutMs ?? DEFAULTS.callTimeoutMs,
       pingIntervalMs: options.pingIntervalMs ?? DEFAULTS.pingIntervalMs,
       requireAcceptedBoot: options.requireAcceptedBoot ?? false,
@@ -220,16 +280,36 @@ export class CentralSystem extends TypedEventEmitter<CentralSystemEvents> {
   }
 
   /**
-   * Create an HTTP server, attach to it and start listening.
+   * Create an HTTP server (HTTPS with `tls`), attach to it and start listening.
    *
    * @returns the bound address; use port `0` to get an ephemeral port.
    */
   async listen(port = 0, host?: string): Promise<AddressInfo> {
     if (this.#ownServer) throw new Error('CentralSystem is already listening');
-    const server = createServer((_request, response) => {
+    const answerPlainHttp = (_request: IncomingMessage, response: ServerResponse): void => {
       response.writeHead(426, { 'Content-Type': 'text/plain', Upgrade: 'websocket' });
       response.end('OCPP 1.6-J endpoint: connect with a WebSocket client\n');
-    });
+    };
+    const { tls, clientCertificates } = this.#options;
+    const server: Server | HttpsServer = tls
+      ? createHttpsServer(
+          {
+            cert: tls.cert as string | Buffer | (string | Buffer)[],
+            key: tls.key,
+            ...(tls.passphrase === undefined ? {} : { passphrase: tls.passphrase }),
+            ...(tls.ca === undefined
+              ? {}
+              : { ca: tls.ca as string | Buffer | (string | Buffer)[] }),
+            ...(tls.ciphers === undefined ? {} : { ciphers: tls.ciphers }),
+            minVersion: tls.minVersion ?? 'TLSv1.2',
+            // Certificates are checked in the upgrade handler, so a refused charge point gets an
+            // HTTP answer and a `rejected` event instead of a bare TLS alert.
+            requestCert: clientCertificates !== undefined,
+            rejectUnauthorized: false,
+          },
+          answerPlainHttp,
+        )
+      : createServer(answerPlainHttp);
     this.#ownServer = server;
     this.attach(server);
     await new Promise<void>((resolve, reject) => {
@@ -311,8 +391,14 @@ export class CentralSystem extends TypedEventEmitter<CentralSystemEvents> {
       status: number,
       message: string,
       headers?: string[],
+      detail?: string,
     ): void => {
-      this.emit('rejected', { reason, identity, remoteAddress });
+      this.emit('rejected', {
+        reason,
+        identity,
+        remoteAddress,
+        ...(detail === undefined ? {} : { detail }),
+      });
       refuse(socket, status, message, headers);
     };
 
@@ -325,13 +411,23 @@ export class CentralSystem extends TypedEventEmitter<CentralSystemEvents> {
       rejectWith('path', undefined, 404, 'Not Found');
       return;
     }
+    const certificate = this.#verifyClientCertificate(request, identity);
+    if (typeof certificate === 'string') {
+      rejectWith('certificate', identity, 403, 'Forbidden', [], certificate);
+      return;
+    }
     const { authenticate } = this.#options;
     if (authenticate) {
       const credentials = parseBasicAuth(request.headers.authorization);
       const password = credentials?.username === identity ? credentials.password : undefined;
       let allowed: boolean;
       try {
-        allowed = await authenticate({ identity, password, request });
+        allowed = await authenticate({
+          identity,
+          password,
+          request,
+          ...(certificate ? { certificate } : {}),
+        });
       } catch {
         allowed = false;
       }
@@ -348,6 +444,35 @@ export class CentralSystem extends TypedEventEmitter<CentralSystemEvents> {
     this.#wss.handleUpgrade(request, socket, head, (ws) => {
       this.#onConnection(ws, request, identity);
     });
+  }
+
+  /**
+   * Security Profile 3 checks. Returns the verified client certificate, `undefined` when none is
+   * needed or presented (and none is required), or a string describing why the charge point must
+   * be refused.
+   */
+  #verifyClientCertificate(
+    request: IncomingMessage,
+    identity: string,
+  ): PeerCertificate | undefined | string {
+    const options = this.#options.clientCertificates;
+    if (!options) return undefined;
+    const socket = request.socket as Partial<TLSSocket>;
+    if (typeof socket.getPeerCertificate !== 'function') return 'not a TLS connection';
+    const certificate = socket.getPeerCertificate();
+    // Without a client certificate Node returns an empty object.
+    if (Object.keys(certificate).length === 0) {
+      return (options.required ?? true) ? 'no client certificate' : undefined;
+    }
+    if (socket.authorized !== true) {
+      const error: unknown = socket.authorizationError;
+      return `untrusted client certificate (${error instanceof Error ? error.message : String(error)})`;
+    }
+    const binding = options.identityBinding ?? 'cn-or-san';
+    if (binding !== false && !certificateMatchesIdentity(identity, certificate, binding)) {
+      return 'client certificate does not belong to this identity';
+    }
+    return certificate;
   }
 
   /** Re-reads the flag; TypeScript would otherwise keep its narrowing across `await`. */
