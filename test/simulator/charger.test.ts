@@ -1,88 +1,23 @@
-import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
+import { describe, expect, it, vi } from 'vitest';
 import {
   MemoryQueueStore,
   RpcError,
-  SimulatedCharger,
   type ChargingProfile,
-  type EvProfile,
   type MeterValue,
-  type SimulatedChargerOptions,
 } from '../../src/index.js';
 import { FakeCentralSystem } from '../helpers.js';
+import {
+  advance,
+  charging,
+  EV,
+  setup,
+  START,
+  started,
+  statuses,
+  useSimulatedTime,
+} from './harness.js';
 
-const START = new Date('2026-05-01T12:00:00.000Z');
-const EV: EvProfile = { batteryKWh: 60, initialSoc: 0.2, targetSoc: 1, maxPowerW: 11_000 };
-
-const chargers: SimulatedCharger[] = [];
-
-beforeEach(() => {
-  vi.useFakeTimers({ now: START });
-});
-
-afterEach(async () => {
-  for (const charger of chargers.splice(0)) await charger.stop();
-  vi.useRealTimers();
-});
-
-const advance = (seconds: number) => vi.advanceTimersByTimeAsync(seconds * 1_000);
-
-function setup(options: Partial<SimulatedChargerOptions> = {}, csms = new FakeCentralSystem()) {
-  let nextTransactionId = 1;
-  csms.handlers.set('BootNotification', () => ({
-    status: 'Accepted',
-    currentTime: new Date().toISOString(),
-    interval: 60,
-  }));
-  csms.handlers.set('Heartbeat', () => ({ currentTime: new Date().toISOString() }));
-  csms.handlers.set('StatusNotification', () => ({}));
-  csms.handlers.set('Authorize', ({ idTag }) => ({
-    idTagInfo: { status: idTag === 'BLOCKED' ? 'Blocked' : 'Accepted' },
-  }));
-  csms.handlers.set('StartTransaction', () => ({
-    idTagInfo: { status: 'Accepted' },
-    transactionId: nextTransactionId++,
-  }));
-  csms.handlers.set('StopTransaction', () => ({}));
-  csms.handlers.set('MeterValues', () => ({}));
-  const charger = new SimulatedCharger({
-    identity: 'SIM-001',
-    url: 'ws://csms.test',
-    connectors: 2,
-    meterValueSampleIntervalS: 60,
-    rebootDelayMs: 1_000,
-    ...options,
-    client: {
-      connector: csms.connector,
-      reconnect: { initialDelayMs: 100, maxDelayMs: 500 },
-      ...options.client,
-    },
-  });
-  chargers.push(charger);
-  return { csms, charger };
-}
-
-async function started(options: Partial<SimulatedChargerOptions> = {}) {
-  const context = setup(options);
-  await context.charger.start();
-  await advance(0);
-  return context;
-}
-
-function statuses(csms: FakeCentralSystem, connectorId: number): string[] {
-  return csms
-    .requestsOf('StatusNotification')
-    .filter((r) => r.connectorId === connectorId)
-    .map((r) => r.status as string);
-}
-
-async function charging(charger: SimulatedCharger, connectorId = 1, ev = EV) {
-  charger.plugIn(connectorId, ev);
-  expect(await charger.swipe(connectorId, 'TAG-1')).toBe(true);
-  await advance(0);
-  const transactionId = charger.connectors[connectorId - 1]?.transactionId;
-  expect(transactionId).toBeDefined();
-  return transactionId!;
-}
+useSimulatedTime();
 
 describe('SimulatedCharger boot and heartbeat', () => {
   it('boots, applies the heartbeat interval and reports every connector', async () => {
@@ -263,7 +198,15 @@ describe('SimulatedCharger sessions', () => {
     await advance(0);
     const [stop] = csms.requestsOf('StopTransaction');
     expect(stop).toMatchObject({ transactionId, reason: 'Local', idTag: 'TAG-1', meterStop: 367 });
-    expect(stop?.transactionData).toHaveLength(2);
+    // Begin, one StopTxnSampledData reading per MeterValueSampleInterval, End.
+    const data = stop?.transactionData as MeterValue[];
+    expect(data.map((mv) => mv.sampledValue[0]?.context)).toEqual([
+      'Transaction.Begin',
+      'Sample.Periodic',
+      'Sample.Periodic',
+      'Transaction.End',
+    ]);
+    expect(data.map((mv) => Number(mv.sampledValue[0]?.value))).toEqual([0, 183, 367, 367]);
     charger.unplug(1);
     await advance(0);
     expect(statuses(csms, 1)).toEqual([
@@ -601,7 +544,7 @@ describe('SimulatedCharger remote control', () => {
     await expect(
       cs.call('TriggerMessage', { requestedMessage: 'FirmwareStatusNotification' }),
     ).resolves.toEqual({
-      status: 'NotImplemented',
+      status: 'Accepted',
     });
     await expect(
       cs.call('TriggerMessage', { requestedMessage: 'Heartbeat', connectorId: 3 }),
@@ -614,7 +557,10 @@ describe('SimulatedCharger remote control', () => {
       'MeterValues',
       'Heartbeat',
       'StatusNotification',
+      'FirmwareStatusNotification',
     ]);
+    // Idle is only ever sent in answer to a TriggerMessage, when no update is in progress.
+    expect(triggered[3]?.request).toEqual({ status: 'Idle' });
     expect(triggered[0]?.request).toMatchObject({
       meterValue: [
         { sampledValue: expect.arrayContaining([expect.objectContaining({ context: 'Trigger' })]) },

@@ -1,6 +1,6 @@
 import { OcppKitError } from '../rpc/errors.js';
 
-/** Connector statuses modelled by the simulator (OCPP 1.6 ChargePointStatus minus Reserved). */
+/** Connector statuses modelled by the simulator: every OCPP 1.6 ChargePointStatus. */
 export type ConnectorStatus =
   | 'Available'
   | 'Preparing'
@@ -8,6 +8,7 @@ export type ConnectorStatus =
   | 'SuspendedEV'
   | 'SuspendedEVSE'
   | 'Finishing'
+  | 'Reserved'
   | 'Faulted'
   | 'Unavailable';
 
@@ -17,7 +18,10 @@ export type ConnectorEvent =
   | 'plugIn'
   /** Cable removed. */
   | 'unplug'
-  /** User authorized (local swipe or remote start) before plugging in. */
+  /**
+   * User authorized (local swipe or remote start) before plugging in, or the reserved idTag was
+   * presented at a reserved connector.
+   */
   | 'authorize'
   /** Preparing for longer than ConnectionTimeOut without a transaction. */
   | 'timeout'
@@ -27,8 +31,17 @@ export type ConnectorEvent =
   | 'suspendByEV'
   /** The EVSE offers no energy (e.g. charging profile limit of 0). */
   | 'suspendByEVSE'
+  /**
+   * The cable was pulled out of the EV but the transaction continues
+   * (`StopTransactionOnEVSideDisconnect` is false).
+   */
+  | 'evDisconnected'
   /** The transaction ended while the cable is still plugged in. */
   | 'transactionStopped'
+  /** ReserveNow was accepted for this connector. */
+  | 'reserve'
+  /** The reservation expired or was cancelled. */
+  | 'reservationEnded'
   | 'fault'
   | 'faultCleared'
   | 'makeUnavailable'
@@ -46,6 +59,7 @@ const OPERATIONAL: readonly ConnectorStatus[] = [
   'SuspendedEV',
   'SuspendedEVSE',
   'Finishing',
+  'Reserved',
   'Unavailable',
 ];
 
@@ -61,16 +75,22 @@ function from(states: readonly ConnectorStatus[], to: ConnectorStatus) {
  */
 export const CONNECTOR_TRANSITIONS: TransitionTable = {
   plugIn: { Available: 'Preparing' },
-  authorize: { Available: 'Preparing' },
+  authorize: { Available: 'Preparing', Reserved: 'Preparing' },
   timeout: { Preparing: 'Available' },
   unplug: from(['Preparing', 'Finishing', ...ACTIVE], 'Available'),
   energyFlowing: from(['Preparing', 'SuspendedEV', 'SuspendedEVSE'], 'Charging'),
   suspendByEV: from(['Preparing', 'Charging', 'SuspendedEVSE'], 'SuspendedEV'),
   suspendByEVSE: from(['Preparing', 'Charging', 'SuspendedEV'], 'SuspendedEVSE'),
+  evDisconnected: from(ACTIVE, 'SuspendedEV'),
   transactionStopped: from(['Preparing', ...ACTIVE], 'Finishing'),
+  reserve: { Available: 'Reserved' },
+  reservationEnded: { Reserved: 'Available' },
   fault: from(OPERATIONAL, 'Faulted'),
   faultCleared: { Faulted: 'Available' },
-  makeUnavailable: from(['Available', 'Preparing', 'Finishing', 'Faulted'], 'Unavailable'),
+  makeUnavailable: from(
+    ['Available', 'Preparing', 'Finishing', 'Reserved', 'Faulted'],
+    'Unavailable',
+  ),
   makeAvailable: { Unavailable: 'Available' },
 };
 

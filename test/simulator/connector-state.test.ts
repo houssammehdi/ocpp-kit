@@ -15,6 +15,7 @@ const STATES: ConnectorStatus[] = [
   'SuspendedEV',
   'SuspendedEVSE',
   'Finishing',
+  'Reserved',
   'Faulted',
   'Unavailable',
 ];
@@ -46,6 +47,15 @@ describe('connector state machine', () => {
     ['Unavailable', 'fault', 'Faulted'],
     ['Faulted', 'faultCleared', 'Available'],
     ['Faulted', 'makeUnavailable', 'Unavailable'],
+    // Reservations (transitions A7, G1, G2, G8, G9 of the status table).
+    ['Available', 'reserve', 'Reserved'],
+    ['Reserved', 'reservationEnded', 'Available'],
+    ['Reserved', 'authorize', 'Preparing'],
+    ['Reserved', 'makeUnavailable', 'Unavailable'],
+    ['Reserved', 'fault', 'Faulted'],
+    // StopTransactionOnEVSideDisconnect = false keeps the transaction.
+    ['Charging', 'evDisconnected', 'SuspendedEV'],
+    ['SuspendedEVSE', 'evDisconnected', 'SuspendedEV'],
   ])('%s --%s--> %s', (from, event, to) => {
     expect(nextStatus(from, event)).toBe(to);
     const fsm = new ConnectorStateMachine(from);
@@ -64,6 +74,12 @@ describe('connector state machine', () => {
     ['Faulted', 'fault'],
     ['Unavailable', 'plugIn'],
     ['Unavailable', 'authorize'],
+    ['Reserved', 'plugIn'],
+    ['Reserved', 'unplug'],
+    ['Charging', 'reserve'],
+    ['Preparing', 'reserve'],
+    ['Available', 'reservationEnded'],
+    ['Available', 'evDisconnected'],
   ])('rejects %s --%s-->', (from, event) => {
     const fsm = new ConnectorStateMachine(from);
     expect(fsm.can(event)).toBe(false);

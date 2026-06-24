@@ -14,7 +14,9 @@ describe('ConfigurationStore', () => {
       value: '2',
     });
     expect(byKey.get('HeartbeatInterval')?.readonly).toBe(false);
-    expect(byKey.get('SupportedFeatureProfiles')?.value).toBe('Core,SmartCharging,RemoteTrigger');
+    expect(byKey.get('SupportedFeatureProfiles')?.value).toBe(
+      'Core,FirmwareManagement,LocalAuthListManagement,Reservation,SmartCharging,RemoteTrigger',
+    );
   });
 
   it('accepts valid changes and notifies listeners', () => {
