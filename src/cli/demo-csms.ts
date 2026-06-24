@@ -1,5 +1,5 @@
 import type { AddressInfo } from 'node:net';
-import type { ChargePointStatus, MeterValue } from '../messages/index.js';
+import type { ChargePointStatus, MessageTrigger, MeterValue } from '../messages/index.js';
 import { CentralSystem } from '../server/central-system.js';
 
 /** What the demo CSMS knows about one connector. */
@@ -41,6 +41,9 @@ interface TransactionRecord {
   readonly meterStart: number;
 }
 
+/** How many StartTransaction requests are remembered for de-duplication. */
+const REMEMBERED_STARTS = 10_000;
+
 function registerWh(meterValues: readonly MeterValue[]): number | undefined {
   for (const meterValue of [...meterValues].reverse()) {
     for (const sample of meterValue.sampledValue) {
@@ -73,8 +76,11 @@ export class DemoCsms {
   readonly cs: CentralSystem;
   readonly stations = new Map<string, StationView>();
   readonly #transactions = new Map<number, TransactionRecord>();
+  /** StartTransaction fingerprint -> transaction id, to answer replays with the same id. */
+  readonly #starts = new Map<string, number>();
   readonly #log: (line: string) => void;
   #nextTransactionId = 1;
+  #nextReservationId = 1;
 
   constructor(options: DemoCsmsOptions = {}) {
     this.#log = options.log ?? (() => undefined);
@@ -124,8 +130,29 @@ export class DemoCsms {
       if (connectorId > 0) this.#connector(connection.identity, connectorId).status = status;
       return {};
     });
-    this.cs.handle('StartTransaction', ({ connectorId, idTag, meterStart }, { connection }) => {
+    this.cs.handle('StartTransaction', (request, { connection }) => {
+      const { connectorId, idTag, meterStart } = request;
+      // A charge point re-sends StartTransaction when the connection dropped before the answer
+      // arrived (transaction messages are delivered at least once): answer with the same id.
+      const fingerprint = [
+        connection.identity,
+        connectorId,
+        idTag,
+        meterStart,
+        request.timestamp,
+        request.reservationId ?? '',
+      ].join('|');
+      const known = this.#starts.get(fingerprint);
+      if (known !== undefined) {
+        this.#log(`= ${connection.identity}#${connectorId} replayed start of tx ${known}`);
+        return { idTagInfo: { status: 'Accepted' }, transactionId: known };
+      }
       const transactionId = this.#nextTransactionId++;
+      this.#starts.set(fingerprint, transactionId);
+      if (this.#starts.size > REMEMBERED_STARTS) {
+        const oldest = this.#starts.keys().next().value;
+        if (oldest !== undefined) this.#starts.delete(oldest);
+      }
       this.#transactions.set(transactionId, {
         identity: connection.identity,
         connectorId,
@@ -146,6 +173,14 @@ export class DemoCsms {
       if (tx && register !== undefined) view.energyWh = register - tx.meterStart;
       view.powerW = measured(meterValue, 'Power.Active.Import') ?? view.powerW;
       view.soc = measured(meterValue, 'SoC') ?? view.soc;
+      return {};
+    });
+    this.cs.handle('FirmwareStatusNotification', ({ status }, { connection }) => {
+      this.#log(`~ ${connection.identity} firmware: ${status}`);
+      return {};
+    });
+    this.cs.handle('DiagnosticsStatusNotification', ({ status }, { connection }) => {
+      this.#log(`~ ${connection.identity} diagnostics: ${status}`);
       return {};
     });
     this.cs.handle('StopTransaction', ({ transactionId, meterStop, reason }, { connection }) => {
@@ -229,6 +264,74 @@ export class DemoCsms {
   async reset(identity: string, type: 'Hard' | 'Soft' = 'Soft'): Promise<string> {
     const response = await this.cs.call(identity, 'Reset', { type });
     return `Reset ${identity} (${type}): ${response.status}`;
+  }
+
+  /** Reserve a connector (0: any) for `idTag` during `minutes`. */
+  async reserve(
+    identity: string,
+    connectorId: number,
+    idTag: string,
+    minutes = 15,
+  ): Promise<string> {
+    const reservationId = this.#nextReservationId++;
+    const expiryDate = new Date(Date.now() + minutes * 60_000).toISOString();
+    const response = await this.cs.call(identity, 'ReserveNow', {
+      connectorId,
+      idTag,
+      reservationId,
+      expiryDate,
+    });
+    return `ReserveNow ${identity}#${connectorId} for ${idTag} (reservation ${reservationId}): ${response.status}`;
+  }
+
+  /** Cancel a reservation. */
+  async cancelReservation(identity: string, reservationId: number): Promise<string> {
+    const response = await this.cs.call(identity, 'CancelReservation', { reservationId });
+    return `CancelReservation ${identity} ${reservationId}: ${response.status}`;
+  }
+
+  /** Ask a charge point to install the firmware at `location` now. */
+  async updateFirmware(identity: string, location: string): Promise<string> {
+    await this.cs.call(identity, 'UpdateFirmware', {
+      location,
+      retrieveDate: new Date().toISOString(),
+    });
+    return `UpdateFirmware ${identity}: requested ${location}`;
+  }
+
+  /** Ask a charge point to upload diagnostics to `location`. */
+  async getDiagnostics(identity: string, location: string): Promise<string> {
+    const { fileName } = await this.cs.call(identity, 'GetDiagnostics', { location });
+    return `GetDiagnostics ${identity}: ${fileName ?? 'no diagnostics available'}`;
+  }
+
+  /** TriggerMessage. */
+  async trigger(
+    identity: string,
+    requestedMessage: MessageTrigger,
+    connectorId?: number,
+  ): Promise<string> {
+    const response = await this.cs.call(identity, 'TriggerMessage', {
+      requestedMessage,
+      ...(connectorId === undefined ? {} : { connectorId }),
+    });
+    return `TriggerMessage ${identity} ${requestedMessage}: ${response.status}`;
+  }
+
+  /** GetConfiguration for one key, or ChangeConfiguration when a value is given. */
+  async configure(identity: string, key: string, value?: string): Promise<string> {
+    if (value !== undefined) {
+      const { status } = await this.cs.call(identity, 'ChangeConfiguration', { key, value });
+      return `ChangeConfiguration ${identity} ${key}=${value}: ${status}`;
+    }
+    const { configurationKey = [], unknownKey = [] } = await this.cs.call(
+      identity,
+      'GetConfiguration',
+      { key: [key] },
+    );
+    const [entry] = configurationKey;
+    if (!entry) return `${identity} ${key}: ${unknownKey.length > 0 ? 'unknown key' : '-'}`;
+    return `${identity} ${entry.key} = ${entry.value ?? ''}${entry.readonly ? ' (read-only)' : ''}`;
   }
 
   /** Remote-start one idle connector on every connected charge point. */

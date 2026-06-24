@@ -106,6 +106,60 @@ describe('demo CSMS', () => {
     });
   });
 
+  it('answers a replayed StartTransaction with the same transaction id', async () => {
+    const { url } = await setup();
+    const cp = new ChargePoint({ identity: 'REPLAY', url, password: 'pw', reconnect: false });
+    cleanups.push(() => cp.close());
+    await cp.connect();
+    await cp.call('BootNotification', { chargePointVendor: 'V', chargePointModel: 'M' });
+    const start = {
+      connectorId: 1,
+      idTag: 'T',
+      meterStart: 5,
+      timestamp: new Date().toISOString(),
+    };
+    const first = await cp.call('StartTransaction', start);
+    const again = await cp.call('StartTransaction', start);
+    const other = await cp.call('StartTransaction', { ...start, meterStart: 6 });
+    expect(again.transactionId).toBe(first.transactionId);
+    expect(other.transactionId).not.toBe(first.transactionId);
+  });
+
+  it('reserves, triggers, configures, updates firmware and fetches diagnostics', async () => {
+    const { csms, charger, logs } = await setup();
+    expect((await executeCommand(csms, 'reserve DEMO-1 2 CARD 5')).output).toBe(
+      'ReserveNow DEMO-1#2 for CARD (reservation 1): Accepted',
+    );
+    await until(() => csms.stations.get('DEMO-1')?.connectors.get(2)?.status === 'Reserved');
+    expect((await executeCommand(csms, 'cancel DEMO-1 1')).output).toBe(
+      'CancelReservation DEMO-1 1: Accepted',
+    );
+    expect((await executeCommand(csms, 'trigger DEMO-1 Heartbeat')).output).toBe(
+      'TriggerMessage DEMO-1 Heartbeat: Accepted',
+    );
+    expect((await executeCommand(csms, 'config DEMO-1 NumberOfConnectors')).output).toBe(
+      'DEMO-1 NumberOfConnectors = 2 (read-only)',
+    );
+    expect((await executeCommand(csms, 'config DEMO-1 HeartbeatInterval 120')).output).toBe(
+      'ChangeConfiguration DEMO-1 HeartbeatInterval=120: Accepted',
+    );
+    expect(charger.configuration.get('HeartbeatInterval')).toBe('120');
+    expect((await executeCommand(csms, 'config DEMO-1 Nope')).output).toBe(
+      'DEMO-1 Nope: unknown key',
+    );
+    expect(
+      (await executeCommand(csms, 'diagnostics DEMO-1 ftp://logs.example.com/')).output,
+    ).toMatch(/^GetDiagnostics DEMO-1: DEMO-1-diagnostics-\d{8}T\d{6}Z\.log$/);
+    await until(() => logs.some((line) => line.includes('diagnostics: Uploading')));
+    expect(
+      (await executeCommand(csms, 'firmware DEMO-1 https://fw.example.com/v2.bin')).output,
+    ).toBe('UpdateFirmware DEMO-1: requested https://fw.example.com/v2.bin');
+    await until(() => logs.some((line) => line.includes('firmware: Downloading')));
+    await expect(executeCommand(csms, 'trigger DEMO-1 Coffee')).rejects.toThrow(/usage: trigger/);
+    await expect(executeCommand(csms, 'reserve DEMO-1')).rejects.toThrow(/usage: reserve/);
+    expect((await executeCommand(csms, 'help')).output).toContain('reserve <id> <connector>');
+  });
+
   it('refuses charge points with the wrong password', async () => {
     const { csms, url } = await setup();
     const intruder = new SimulatedCharger({

@@ -1,5 +1,6 @@
 import { createInterface } from 'node:readline';
 import { parseArgs } from 'node:util';
+import { MessageTrigger } from '../messages/index.js';
 import { parseDuration, parseInteger, UsageError } from './args.js';
 import { DemoCsms, type StationView } from './demo-csms.js';
 import { fit, formatNumber, renderTable, untilInterrupted, type Column } from './format.js';
@@ -19,11 +20,23 @@ Options:
   -h, --help                Show this help
 
 Interactive commands (when attached to a terminal):
-  start <id> [connector] [idTag]   stop <id> [connector|txId]   limit <id> <kW|off>
-  reset <id> [hard]                list                         help   quit`;
+  start <id> [connector] [idTag]        stop <id> [connector|txId]
+  limit <id> <kW|off>                   reset <id> [hard]
+  reserve <id> <connector> <idTag> [minutes]    cancel <id> <reservationId>
+  trigger <id> <message> [connector]    config <id> <key> [value]
+  firmware <id> <url>                   diagnostics <id> <url>
+  list   help   quit`;
 
 const COMMAND_HELP =
-  'commands: start <id> [conn] [tag] | stop <id> [conn|tx] | limit <id> <kW|off> | reset <id> [hard] | quit';
+  'commands: start | stop | limit | reset | reserve | cancel | trigger | config | firmware | diagnostics | list | quit (help for details)';
+
+const COMMAND_DETAILS = `start <id> [connector] [idTag]  stop <id> [connector|txId]  limit <id> <kW|off>  reset <id> [hard]
+reserve <id> <connector> <idTag> [minutes]  cancel <id> <reservationId>
+trigger <id> <message> [connector]  config <id> <key> [value]  firmware <id> <url>  diagnostics <id> <url>`;
+
+const TRIGGERS: ReadonlySet<string> = new Set(
+  MessageTrigger.anyOf.map((literal: { const: string }) => literal.const),
+);
 
 function connectorSummary(station: StationView): string {
   return [...station.connectors.entries()]
@@ -97,7 +110,7 @@ export async function executeCommand(csms: DemoCsms, line: string): Promise<Comm
     case '':
       return output('');
     case 'help':
-      return output(COMMAND_HELP);
+      return output(COMMAND_DETAILS);
     case 'quit':
     case 'exit':
       return { output: '', quit: true };
@@ -120,6 +133,55 @@ export async function executeCommand(csms: DemoCsms, line: string): Promise<Comm
     }
     case 'reset':
       return output(csms.reset(needIdentity(), args[0] === 'hard' ? 'Hard' : 'Soft'));
+    case 'reserve': {
+      const [connector, idTag, minutes] = args;
+      if (connector === undefined || idTag === undefined) {
+        throw new UsageError('usage: reserve <id> <connector> <idTag> [minutes]');
+      }
+      return output(
+        csms.reserve(
+          needIdentity(),
+          parseInteger(connector, 'connector', 0),
+          idTag,
+          minutes === undefined ? undefined : parseInteger(minutes, 'minutes'),
+        ),
+      );
+    }
+    case 'cancel': {
+      if (args[0] === undefined) throw new UsageError('usage: cancel <id> <reservationId>');
+      return output(
+        csms.cancelReservation(needIdentity(), parseInteger(args[0], 'reservationId', 0)),
+      );
+    }
+    case 'trigger': {
+      const [message, connector] = args;
+      if (message === undefined || !TRIGGERS.has(message)) {
+        throw new UsageError(`usage: trigger <id> <${[...TRIGGERS].join('|')}> [connector]`);
+      }
+      return output(
+        csms.trigger(
+          needIdentity(),
+          message as MessageTrigger,
+          connector === undefined ? undefined : parseInteger(connector, 'connector', 0),
+        ),
+      );
+    }
+    case 'config': {
+      const [key, value] = args;
+      if (key === undefined) throw new UsageError('usage: config <id> <key> [value]');
+      return output(csms.configure(needIdentity(), key, value));
+    }
+    case 'firmware':
+    case 'diagnostics': {
+      const [location] = args;
+      if (location === undefined) throw new UsageError(`usage: ${command} <id> <url>`);
+      const identity = needIdentity();
+      return output(
+        command === 'firmware'
+          ? csms.updateFirmware(identity, location)
+          : csms.getDiagnostics(identity, location),
+      );
+    }
     default:
       return output(`unknown command "${command}" (${COMMAND_HELP})`);
   }
