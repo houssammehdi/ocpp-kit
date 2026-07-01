@@ -1,6 +1,14 @@
 import { parseArgs } from 'node:util';
 import { Fleet, type FleetStats } from '../simulator/fleet.js';
-import { parseDuration, parseInteger, parseRangeSeconds, parseRate, parseUrl } from './args.js';
+import {
+  clientTlsFromFlags,
+  parseDuration,
+  parseInteger,
+  parseRangeSeconds,
+  parseRate,
+  parseUrl,
+  UsageError,
+} from './args.js';
 import { formatClock, formatNumber, untilInterrupted } from './format.js';
 
 export const SIM_USAGE = `Usage: ocpp-kit sim [options]
@@ -15,7 +23,10 @@ Options:
       --connectors <n>        Connectors per charge point (default 2)
       --max-power <kW>        Hardware limit per connector (default 22)
       --seed <n>              Seed for deterministic behaviour (default 1)
-      --password <secret>     HTTP Basic auth password (Security Profile 1)
+      --password <secret>     HTTP Basic auth password (Security Profile 1, or 2 over wss)
+      --ca <file>             Trust only this CA for wss:// (pins the Central System's CA)
+      --cert <file>           Client certificate for Security Profile 3 (with --key)
+      --key <file>            Private key of --cert
       --meter-interval <dur>  MeterValueSampleInterval (default 60s)
       --idle <range>          Idle time between sessions (default 30s-5m)
       --max-session <dur>     Maximum session length (default 4h)
@@ -55,6 +66,9 @@ export async function runSim(
       'max-power': { type: 'string', default: '22' },
       seed: { type: 'string', default: '1' },
       password: { type: 'string' },
+      ca: { type: 'string' },
+      cert: { type: 'string' },
+      key: { type: 'string' },
       'meter-interval': { type: 'string', default: '60s' },
       idle: { type: 'string', default: '30s-5m' },
       'max-session': { type: 'string', default: '4h' },
@@ -71,7 +85,8 @@ export async function runSim(
     return;
   }
   const maxPowerKW = Number(values['max-power']);
-  if (!(maxPowerKW > 0)) throw new Error('--max-power must be a positive number of kW');
+  if (!(maxPowerKW > 0)) throw new UsageError('--max-power must be a positive number of kW');
+  const tls = clientTlsFromFlags(values);
   const fleet = new Fleet({
     url: parseUrl(values.url),
     count: parseInteger(values.count, 'count'),
@@ -89,6 +104,7 @@ export async function runSim(
             maxSessionS: parseDuration(values['max-session']) / 1_000,
           },
       ...(values.password === undefined ? {} : { password: values.password }),
+      ...(tls === undefined ? {} : { client: { tls } }),
     },
   });
   const durationMs = values.duration === undefined ? undefined : parseDuration(values.duration);

@@ -1,8 +1,14 @@
 import { createInterface } from 'node:readline';
 import { parseArgs } from 'node:util';
 import { MessageTrigger } from '../messages/index.js';
-import { parseDuration, parseInteger, UsageError } from './args.js';
-import { DemoCsms, type StationView } from './demo-csms.js';
+import {
+  parseCertificateIdentity,
+  parseDuration,
+  parseInteger,
+  readPem,
+  UsageError,
+} from './args.js';
+import { DemoCsms, type DemoCsmsOptions, type StationView } from './demo-csms.js';
 import { fit, formatNumber, renderTable, untilInterrupted, type Column } from './format.js';
 
 export const CSMS_USAGE = `Usage: ocpp-kit csms [options]
@@ -13,7 +19,13 @@ Options:
   -p, --port <n>            Port to listen on (default 9220)
       --host <addr>         Interface to bind (default: all)
       --path <prefix>       URL path prefix before the identity (default /)
-      --password <secret>   Require HTTP Basic auth (Security Profile 1)
+      --password <secret>   Require HTTP Basic auth (Security Profile 1, or 2 with TLS)
+      --tls-cert <file>     Serve wss:// with this PEM certificate (Security Profile 2)
+      --tls-key <file>      Private key of --tls-cert
+      --tls-ca <file>       Require client certificates issued by this CA (Profile 3)
+      --client-certs <mode> required (default with --tls-ca) or optional
+      --cert-identity <r>   How the identity must match the client certificate:
+                            cn-or-san (default), cn, san or none
       --heartbeat <dur>     Heartbeat interval handed out at boot (default 60s)
       --auto-start <dur>    Remote-start an idle connector on every charger each interval
       --no-table            Log events line by line instead of drawing a live table
@@ -187,6 +199,54 @@ export async function executeCommand(csms: DemoCsms, line: string): Promise<Comm
   }
 }
 
+/** Server TLS settings from the `csms` flags. */
+function serverTlsFromFlags(values: {
+  readonly 'tls-cert'?: string | undefined;
+  readonly 'tls-key'?: string | undefined;
+  readonly 'tls-ca'?: string | undefined;
+  readonly 'client-certs'?: string | undefined;
+  readonly 'cert-identity'?: string | undefined;
+}): Pick<DemoCsmsOptions, 'tls' | 'clientCertificates'> {
+  const certFile = values['tls-cert'];
+  const keyFile = values['tls-key'];
+  const caFile = values['tls-ca'];
+  if (certFile === undefined || keyFile === undefined) {
+    if (certFile !== undefined || keyFile !== undefined || caFile !== undefined) {
+      throw new UsageError('--tls-cert and --tls-key go together (and --tls-ca needs both)');
+    }
+    if (values['client-certs'] !== undefined || values['cert-identity'] !== undefined) {
+      throw new UsageError('--client-certs and --cert-identity need --tls-ca');
+    }
+    return {};
+  }
+  const tls = {
+    cert: readPem(certFile, 'tls-cert'),
+    key: readPem(keyFile, 'tls-key'),
+    ...(caFile === undefined ? {} : { ca: readPem(caFile, 'tls-ca') }),
+  };
+  if (caFile === undefined) {
+    if (values['client-certs'] !== undefined || values['cert-identity'] !== undefined) {
+      throw new UsageError('--client-certs and --cert-identity need --tls-ca');
+    }
+    return { tls };
+  }
+  const mode = values['client-certs'] ?? 'required';
+  if (mode !== 'required' && mode !== 'optional') {
+    throw new UsageError(`--client-certs must be required or optional, got "${mode}"`);
+  }
+  const binding =
+    values['cert-identity'] === undefined
+      ? undefined
+      : parseCertificateIdentity(values['cert-identity']);
+  return {
+    tls,
+    clientCertificates: {
+      required: mode === 'required',
+      ...(binding === undefined ? {} : { identityBinding: binding }),
+    },
+  };
+}
+
 /** `ocpp-kit csms` entry point. */
 export async function runCsms(
   argv: readonly string[],
@@ -202,6 +262,11 @@ export async function runCsms(
       heartbeat: { type: 'string', default: '60s' },
       'auto-start': { type: 'string' },
       'no-table': { type: 'boolean', default: false },
+      'tls-cert': { type: 'string' },
+      'tls-key': { type: 'string' },
+      'tls-ca': { type: 'string' },
+      'client-certs': { type: 'string' },
+      'cert-identity': { type: 'string' },
       help: { type: 'boolean', short: 'h', default: false },
     },
     strict: true,
@@ -212,6 +277,7 @@ export async function runCsms(
     return;
   }
   const port = parseInteger(values.port, 'port', 0);
+  const tls = serverTlsFromFlags(values);
   const heartbeatIntervalS = Math.round(parseDuration(values.heartbeat) / 1_000);
   const autoStartMs =
     values['auto-start'] === undefined ? undefined : parseDuration(values['auto-start']);
@@ -233,11 +299,12 @@ export async function runCsms(
     basePath: values.path,
     log,
     ...(values.password === undefined ? {} : { password: values.password }),
+    ...tls,
   });
   const address = await csms.listen(port, values.host);
   const shown = values.host ?? 'localhost';
   log(
-    `listening on ws://${shown}:${address.port}${values.path === '/' ? '' : values.path}/<identity> (ocpp1.6)`,
+    `listening on ${tls.tls ? 'wss' : 'ws'}://${shown}:${address.port}${values.path === '/' ? '' : values.path}/<identity> (ocpp1.6${tls.clientCertificates ? ', client certificates' : ''})`,
   );
 
   const timers: NodeJS.Timeout[] = [];

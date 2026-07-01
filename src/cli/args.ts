@@ -1,3 +1,7 @@
+import { readFileSync } from 'node:fs';
+import type { ChargePointTlsOptions } from '../client/connector.js';
+import type { CertificateIdentityBinding } from '../server/certificates.js';
+
 /** Error raised for invalid command line input; the CLI prints it without a stack trace. */
 export class UsageError extends Error {
   override name = 'UsageError';
@@ -70,4 +74,49 @@ export function parseUrl(input: string): string {
     throw new UsageError(`URL must use ws:// or wss://, got "${input}"`);
   }
   return input;
+}
+
+/** Read a PEM file named on the command line. */
+export function readPem(path: string, flag: string): string {
+  try {
+    return readFileSync(path, 'utf8');
+  } catch (error) {
+    throw new UsageError(
+      `--${flag}: cannot read ${path} (${error instanceof Error ? error.message : String(error)})`,
+    );
+  }
+}
+
+/** Client-side TLS flags shared by `sim` and `conform`: --ca, --cert, --key. */
+export function clientTlsFromFlags(values: {
+  readonly ca?: string | undefined;
+  readonly cert?: string | undefined;
+  readonly key?: string | undefined;
+}): ChargePointTlsOptions | undefined {
+  if (values.cert !== undefined && values.key === undefined) {
+    throw new UsageError('--cert needs --key');
+  }
+  if (values.key !== undefined && values.cert === undefined) {
+    throw new UsageError('--key needs --cert');
+  }
+  if (values.ca === undefined && values.cert === undefined) return undefined;
+  return {
+    ...(values.ca === undefined ? {} : { ca: readPem(values.ca, 'ca') }),
+    ...(values.cert === undefined ? {} : { cert: readPem(values.cert, 'cert') }),
+    ...(values.key === undefined ? {} : { key: readPem(values.key, 'key') }),
+  };
+}
+
+/** Parse `--cert-identity`. */
+export function parseCertificateIdentity(input: string): CertificateIdentityBinding | false {
+  switch (input) {
+    case 'cn':
+    case 'san':
+    case 'cn-or-san':
+      return input;
+    case 'none':
+      return false;
+    default:
+      throw new UsageError(`--cert-identity must be cn, san, cn-or-san or none, got "${input}"`);
+  }
 }

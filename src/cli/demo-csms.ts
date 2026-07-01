@@ -1,6 +1,10 @@
 import type { AddressInfo } from 'node:net';
 import type { ChargePointStatus, MessageTrigger, MeterValue } from '../messages/index.js';
-import { CentralSystem } from '../server/central-system.js';
+import {
+  CentralSystem,
+  type CentralSystemTlsOptions,
+  type ClientCertificateOptions,
+} from '../server/central-system.js';
 
 /** What the demo CSMS knows about one connector. */
 export interface ConnectorView {
@@ -31,6 +35,10 @@ export interface DemoCsmsOptions {
   readonly password?: string;
   readonly basePath?: string;
   readonly pingIntervalMs?: number;
+  /** Serve wss:// (Security Profiles 2 and 3). */
+  readonly tls?: CentralSystemTlsOptions;
+  /** Require client certificates (Security Profile 3). */
+  readonly clientCertificates?: ClientCertificateOptions;
   /** Receives human-readable event lines. */
   readonly log?: (line: string) => void;
 }
@@ -88,6 +96,10 @@ export class DemoCsms {
     this.cs = new CentralSystem({
       ...(options.basePath === undefined ? {} : { basePath: options.basePath }),
       ...(options.pingIntervalMs === undefined ? {} : { pingIntervalMs: options.pingIntervalMs }),
+      ...(options.tls === undefined ? {} : { tls: options.tls }),
+      ...(options.clientCertificates === undefined
+        ? {}
+        : { clientCertificates: options.clientCertificates }),
       ...(password === undefined
         ? {}
         : { authenticate: (request) => request.password === password }),
