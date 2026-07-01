@@ -50,7 +50,7 @@ function normaliseFingerprint(value: string): string {
  * typed with Node's `ConnectionOptions`: `@types/ws` declares `checkServerIdentity` as returning
  * a boolean, but ws passes it to Node unchanged, which expects an `Error` or `undefined`.
  */
-function tlsClientOptions(tls: ChargePointTlsOptions | undefined): ConnectionOptions {
+export function tlsClientOptions(tls: ChargePointTlsOptions | undefined): ConnectionOptions {
   if (!tls) return {};
   const pins = tls.pinnedFingerprints?.map(normaliseFingerprint);
   return {
