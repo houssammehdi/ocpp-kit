@@ -179,6 +179,8 @@ export class DemoCsms {
       return { idTagInfo: { status: 'Accepted' }, transactionId };
     });
     this.cs.handle('MeterValues', ({ connectorId, transactionId, meterValue }, { connection }) => {
+      // Connector 0 is the main meter of the whole charge point, not a connector to track.
+      if (connectorId === 0) return {};
       const view = this.#connector(connection.identity, connectorId);
       const tx = transactionId === undefined ? undefined : this.#transactions.get(transactionId);
       const register = registerWh(meterValue);

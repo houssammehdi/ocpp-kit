@@ -125,6 +125,35 @@ describe('demo CSMS', () => {
     expect(other.transactionId).not.toBe(first.transactionId);
   });
 
+  it('keeps main-meter values of connector 0 out of the connector list', async () => {
+    // Regression: MeterValues for connector 0 created a connector 0 entry, which auto-start then
+    // picked, sending RemoteStartTransaction with the invalid connectorId 0 (rejected locally)
+    // on every round instead of starting connector 1.
+    const { csms, url } = await setup();
+    const cp = new ChargePoint({ identity: 'MAIN-METER', url, password: 'pw', reconnect: false });
+    cleanups.push(() => cp.close());
+    const remoteStarts: unknown[] = [];
+    cp.handle('RemoteStartTransaction', (request) => {
+      remoteStarts.push(request);
+      return { status: 'Rejected' };
+    });
+    await cp.connect();
+    await cp.call('BootNotification', { chargePointVendor: 'V', chargePointModel: 'M' });
+    const timestamp = new Date().toISOString();
+    await cp.call('StatusNotification', {
+      connectorId: 1,
+      errorCode: 'NoError',
+      status: 'Available',
+    });
+    await cp.call('MeterValues', {
+      connectorId: 0,
+      meterValue: [{ timestamp, sampledValue: [{ value: '1234', context: 'Sample.Clock' }] }],
+    });
+    expect([...csms.stations.get('MAIN-METER')!.connectors.keys()]).toEqual([1]);
+    await csms.autoStart();
+    expect(remoteStarts).toEqual([{ idTag: 'AUTO', connectorId: 1 }]);
+  });
+
   it('reserves, triggers, configures, updates firmware and fetches diagnostics', async () => {
     const { csms, charger, logs } = await setup();
     expect((await executeCommand(csms, 'reserve DEMO-1 2 CARD 5')).output).toBe(
