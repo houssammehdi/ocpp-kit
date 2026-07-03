@@ -29,3 +29,35 @@ jobs:
       - run: npm run build
       - name: Smoke-test the CLI
         run: node dist/cli/main.js --version && node dist/cli/main.js sim --help > /dev/null
+
+  conformance:
+    name: Conformance of the demo CSMS
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+      - run: npm ci
+      - run: npm run build
+      - name: Run the conformance checker against the demo CSMS
+        run: |
+          node dist/cli/main.js csms --port 9220 --host 127.0.0.1 --no-table \
+            --password ci-password-1234 --auto-start 1s > csms.log 2>&1 &
+          csms=$!
+          for attempt in $(seq 1 50); do
+            (echo > /dev/tcp/127.0.0.1/9220) 2>/dev/null && break
+            sleep 0.2
+          done
+          node dist/cli/main.js conform --url ws://127.0.0.1:9220 --identity CI-CONFORMANCE \
+            --password ci-password-1234
+          node dist/cli/main.js conform --url ws://127.0.0.1:9220 --identity CI-JUNIT \
+            --password ci-password-1234 --format junit --output conformance-junit.xml
+          kill "$csms"
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: conformance-report
+          path: conformance-junit.xml
+          if-no-files-found: ignore
