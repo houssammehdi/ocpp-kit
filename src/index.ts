@@ -7,6 +7,7 @@
  * - `client`: {@link ChargePoint} client with reconnect and an offline queue
  * - `simulator`: virtual chargers and fleets for load testing
  * - `conformance`: checks a Central System against the specification ({@link runConformance})
+ * - `observability`: Prometheus metrics ({@link instrumentCentralSystem}) and structured logs
  *
  * @packageDocumentation
  */
@@ -18,4 +19,5 @@ export * from './client/index.js';
 export { TypedEventEmitter, type EventMap } from './util/typed-emitter.js';
 export * from './simulator/index.js';
 export * from './conformance/index.js';
+export * from './observability/index.js';
 export { VERSION } from './version.js';
