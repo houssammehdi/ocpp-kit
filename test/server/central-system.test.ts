@@ -9,6 +9,7 @@ import {
   HandshakeError,
   parseBasicAuth,
   RpcError,
+  type CentralSystemCallCompletedEvent,
   type CentralSystemCallEvent,
   type CentralSystemOptions,
 } from '../../src/index.js';
@@ -51,6 +52,41 @@ function rawSocket(
 }
 
 describe('CentralSystem connections', () => {
+  it('reports settled outbound calls and raw frames of every connection', async () => {
+    const { cs, url } = await startServer();
+    const completed: CentralSystemCallCompletedEvent[] = [];
+    const frames: [string, 'in' | 'out', string][] = [];
+    cs.on('callCompleted', (event) => completed.push(event));
+    cs.on('message', (connection, direction, raw) =>
+      frames.push([connection.identity, direction, raw]),
+    );
+    const cp = client(url, 'CP-EVENTS');
+    cp.handle('ClearCache', () => ({ status: 'Accepted' }));
+    await cp.connect();
+    await until(() => cs.connections.has('CP-EVENTS'));
+    await cs.call('CP-EVENTS', 'ClearCache', {});
+    await expect(cs.call('CP-EVENTS', 'Reset', { type: 'Hard' })).rejects.toBeInstanceOf(RpcError);
+    expect(
+      completed.map(({ connection, action, response, error }) => [
+        connection.identity,
+        action,
+        response,
+        error?.message,
+      ]),
+    ).toEqual([
+      ['CP-EVENTS', 'ClearCache', { status: 'Accepted' }, undefined],
+      ['CP-EVENTS', 'Reset', undefined, 'Action Reset is not supported'],
+    ]);
+    expect(completed[0]?.durationMs).toBeGreaterThanOrEqual(0);
+    expect(frames.map(([identity, direction]) => `${identity} ${direction}`)).toEqual([
+      'CP-EVENTS out',
+      'CP-EVENTS in',
+      'CP-EVENTS out',
+      'CP-EVENTS in',
+    ]);
+    expect(frames[0]?.[2]).toMatch(/^\[2,"[^"]+","ClearCache",\{\}\]$/);
+  });
+
   it('accepts ocpp1.6 clients, takes the identity from the path and dispatches typed calls', async () => {
     const { cs, url } = await startServer();
     cs.handle('BootNotification', (payload, { connection }) => {

@@ -7,7 +7,12 @@ import { WebSocketServer, type WebSocket } from 'ws';
 import type { CentralSystemToChargePoint, ChargePointToCentralSystem } from '../messages/index.js';
 import { RpcError } from '../rpc/errors.js';
 import type { JsonObject } from '../rpc/frames.js';
-import { HandlerRegistry, type CallOptions, type RequestHandler } from '../rpc/peer.js';
+import {
+  HandlerRegistry,
+  type CallOptions,
+  type CompletedCallEvent,
+  type RequestHandler,
+} from '../rpc/peer.js';
 import type { ActionName, RequestOf, ResponseOf } from '../rpc/validation.js';
 import { OCPP16_SUBPROTOCOL } from '../transport/websocket.js';
 import { TypedEventEmitter } from '../util/typed-emitter.js';
@@ -123,11 +128,21 @@ export interface CentralSystemCallEvent {
   readonly durationMs: number;
 }
 
+/** Emitted after a CALL sent to a charge point settled (answered, failed or timed out). */
+export interface CentralSystemCallCompletedEvent extends CompletedCallEvent {
+  readonly connection: ChargePointConnection;
+}
+
 /** Events emitted by {@link CentralSystem}. */
 export interface CentralSystemEvents {
   connect: (connection: ChargePointConnection) => void;
   disconnect: (connection: ChargePointConnection, code: number, reason: string) => void;
+  /** An inbound CALL from a charge point was answered. */
   call: (event: CentralSystemCallEvent) => void;
+  /** A CALL sent to a charge point settled, with its round-trip time. */
+  callCompleted: (event: CentralSystemCallCompletedEvent) => void;
+  /** Raw frame traffic of every connection, for protocol logging. */
+  message: (connection: ChargePointConnection, direction: 'in' | 'out', raw: string) => void;
   rejected: (info: {
     readonly reason: RejectionReason;
     readonly identity: string | undefined;
@@ -508,6 +523,12 @@ export class CentralSystem extends TypedEventEmitter<CentralSystemEvents> {
     connection.peer.on('message', () => this.#alive.add(connection));
     connection.peer.on('callHandled', (event) => {
       this.emit('call', { connection, ...event });
+    });
+    connection.peer.on('callCompleted', (event) => {
+      this.emit('callCompleted', { connection, ...event });
+    });
+    connection.peer.on('message', (direction, raw) => {
+      this.emit('message', connection, direction, raw);
     });
     connection.peer.on('badMessage', (raw, error) => {
       this.emit('badMessage', connection, raw, error);
