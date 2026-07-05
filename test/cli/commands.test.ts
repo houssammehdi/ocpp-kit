@@ -2,7 +2,7 @@ import { afterEach, describe, expect, it, vi } from 'vitest';
 import { CSMS_USAGE, runCsms } from '../../src/cli/csms.js';
 import { DemoCsms } from '../../src/cli/demo-csms.js';
 import { runSim, SIM_USAGE } from '../../src/cli/sim.js';
-import type { FleetStats } from '../../src/index.js';
+import { ChargePoint, type FleetStats } from '../../src/index.js';
 import { until } from '../helpers.js';
 
 afterEach(() => {
@@ -113,5 +113,59 @@ describe('CLI commands', () => {
     controller.abort();
     await csms;
     expect(lines.at(-1)).toBe('CSMS stopped.');
+  });
+});
+
+describe('ocpp-kit csms observability', () => {
+  it('serves Prometheus metrics and writes JSON log lines', async () => {
+    const stdout: string[] = [];
+    const stderr: string[] = [];
+    vi.spyOn(process.stdout, 'write').mockImplementation((chunk: string | Uint8Array) => {
+      stdout.push(String(chunk));
+      return true;
+    });
+    vi.spyOn(process.stderr, 'write').mockImplementation((chunk: string | Uint8Array) => {
+      stderr.push(String(chunk));
+      return true;
+    });
+    const controller = new AbortController();
+    const csms = runCsms(
+      ['--port', '0', '--host', '127.0.0.1', '--metrics-port', '0', '--log-json'],
+      { signal: controller.signal },
+    );
+    await until(() => stderr.some((line) => line.includes('metrics on')));
+    const port = /:(\d+)\/<identity>/.exec(stderr.join(''))?.[1];
+    const metricsUrl = /(http:\/\/\S+\/metrics)/.exec(stderr.join(''))?.[1];
+    expect(port).toBeDefined();
+    expect(metricsUrl).toBeDefined();
+
+    const cp = new ChargePoint({
+      identity: 'CLI-METRICS',
+      url: `ws://127.0.0.1:${port}`,
+      reconnect: false,
+    });
+    await cp.connect();
+    await cp.call('BootNotification', { chargePointVendor: 'V', chargePointModel: 'M' });
+    const response = await fetch(metricsUrl!.replace('localhost', '127.0.0.1'));
+    expect(response.headers.get('content-type')).toBe('text/plain; version=0.0.4; charset=utf-8');
+    const text = await response.text();
+    expect(text).toContain('ocpp_connected_charge_points 1');
+    expect(text).toContain('ocpp_inbound_calls_total{action="BootNotification",result="ok"} 1');
+    expect((await fetch(metricsUrl!.replace('/metrics', '/other'))).status).toBe(404);
+    await cp.close();
+
+    const entries = stdout
+      .join('')
+      .trim()
+      .split('\n')
+      .map((line) => JSON.parse(line) as { event: string; identity?: string });
+    expect(entries.map((entry) => entry.event)).toEqual(
+      expect.arrayContaining(['connect', 'call']),
+    );
+    expect(entries.every((entry) => entry.identity === 'CLI-METRICS')).toBe(true);
+    controller.abort();
+    await csms;
+    expect(stderr.join('')).toContain('CSMS stopped.');
+    expect(stdout.join('')).not.toContain('CSMS stopped.');
   });
 });

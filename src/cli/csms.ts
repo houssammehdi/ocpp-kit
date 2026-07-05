@@ -1,6 +1,11 @@
+import { createServer, type Server } from 'node:http';
+import type { AddressInfo } from 'node:net';
 import { createInterface } from 'node:readline';
 import { parseArgs } from 'node:util';
 import { MessageTrigger } from '../messages/index.js';
+import { instrumentCentralSystem } from '../observability/central-system.js';
+import { attachLogger, jsonLines } from '../observability/logging.js';
+import { PROMETHEUS_CONTENT_TYPE } from '../observability/metrics.js';
 import {
   parseCertificateIdentity,
   parseDuration,
@@ -28,6 +33,8 @@ Options:
                             cn-or-san (default), cn, san or none
       --heartbeat <dur>     Heartbeat interval handed out at boot (default 60s)
       --auto-start <dur>    Remote-start an idle connector on every charger each interval
+      --metrics-port <n>    Serve Prometheus metrics on http://<host>:<n>/metrics
+      --log-json            Write structured JSON log lines to stdout (text goes to stderr)
       --no-table            Log events line by line instead of drawing a live table
   -h, --help                Show this help
 
@@ -261,6 +268,8 @@ export async function runCsms(
       password: { type: 'string' },
       heartbeat: { type: 'string', default: '60s' },
       'auto-start': { type: 'string' },
+      'metrics-port': { type: 'string' },
+      'log-json': { type: 'boolean', default: false },
       'no-table': { type: 'boolean', default: false },
       'tls-cert': { type: 'string' },
       'tls-key': { type: 'string' },
@@ -281,14 +290,21 @@ export async function runCsms(
   const heartbeatIntervalS = Math.round(parseDuration(values.heartbeat) / 1_000);
   const autoStartMs =
     values['auto-start'] === undefined ? undefined : parseDuration(values['auto-start']);
+  const metricsPort =
+    values['metrics-port'] === undefined
+      ? undefined
+      : parseInteger(values['metrics-port'], 'metrics-port', 0);
+  const jsonLog = values['log-json'];
   const interactive = process.stdout.isTTY && process.stdin.isTTY;
-  const table = interactive && !values['no-table'];
+  const table = interactive && !values['no-table'] && !jsonLog;
   const recent: string[] = [];
   const log = (line: string): void => {
     const stamped = `${new Date().toISOString().slice(11, 19)} ${line}`;
     if (table) {
       recent.push(stamped);
       if (recent.length > 6) recent.shift();
+    } else if (jsonLog) {
+      process.stderr.write(`${stamped}\n`);
     } else {
       console.log(stamped);
     }
@@ -301,11 +317,31 @@ export async function runCsms(
     ...(values.password === undefined ? {} : { password: values.password }),
     ...tls,
   });
+  const detachLogger = jsonLog ? attachLogger(csms.cs, jsonLines(process.stdout)) : undefined;
   const address = await csms.listen(port, values.host);
   const shown = values.host ?? 'localhost';
   log(
     `listening on ${tls.tls ? 'wss' : 'ws'}://${shown}:${address.port}${values.path === '/' ? '' : values.path}/<identity> (ocpp1.6${tls.clientCertificates ? ', client certificates' : ''})`,
   );
+  let metricsServer: Server | undefined;
+  if (metricsPort !== undefined) {
+    const metrics = instrumentCentralSystem(csms.cs);
+    const server = createServer((request, response) => {
+      if (request.method === 'GET' && request.url?.split('?')[0] === '/metrics') {
+        response.writeHead(200, { 'Content-Type': PROMETHEUS_CONTENT_TYPE });
+        response.end(metrics.render());
+      } else {
+        response.writeHead(404).end();
+      }
+    });
+    metricsServer = server;
+    await new Promise<void>((resolve, reject) => {
+      server.once('error', reject);
+      server.listen(metricsPort, values.host, resolve);
+    });
+    const { port: bound } = server.address() as AddressInfo;
+    log(`metrics on http://${shown}:${bound}/metrics`);
+  }
 
   const timers: NodeJS.Timeout[] = [];
   if (autoStartMs !== undefined) {
@@ -325,8 +361,19 @@ export async function runCsms(
       for (const timer of timers) clearInterval(timer);
       rl?.close();
       await csms.close();
+      detachLogger?.();
+      await new Promise<void>((resolve) => {
+        if (!metricsServer) {
+          resolve();
+          return;
+        }
+        metricsServer.close(() => resolve());
+        metricsServer.closeAllConnections();
+      });
       if (table) process.stdout.write('\n');
-      console.log('CSMS stopped.');
+      // With --log-json, stdout carries only JSON lines.
+      if (jsonLog) process.stderr.write('CSMS stopped.\n');
+      else console.log('CSMS stopped.');
     })());
 
   if (table) {
