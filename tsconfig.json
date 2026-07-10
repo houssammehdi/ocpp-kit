@@ -23,5 +23,5 @@
     "sourceMap": true,
     "outDir": "dist"
   },
-  "include": ["src", "test", "examples", "*.ts"]
+  "include": ["src", "test", "examples", "bench", "*.ts"]
 }

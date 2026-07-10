@@ -27,7 +27,7 @@ export default tseslint.config(
     },
   },
   {
-    files: ['src/cli/**/*.ts', 'examples/**/*.ts'],
+    files: ['src/cli/**/*.ts', 'examples/**/*.ts', 'bench/**/*.ts'],
     rules: { 'no-console': 'off' },
   },
   {

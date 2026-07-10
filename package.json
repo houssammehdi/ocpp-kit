@@ -50,6 +50,7 @@
     "test:coverage": "vitest run --coverage",
     "format": "prettier --write .",
     "format:check": "prettier --check .",
+    "bench": "tsx bench/run.ts",
     "example:csms": "tsx examples/basic-csms.ts",
     "example:charge-point": "tsx examples/basic-charge-point.ts",
     "example:smart-charging": "tsx examples/smart-charging.ts"
