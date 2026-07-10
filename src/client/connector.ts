@@ -9,9 +9,9 @@ import type { Duplex } from '../rpc/duplex.js';
 import { OcppKitError } from '../rpc/errors.js';
 import { OCPP16_SUBPROTOCOL, webSocketDuplex } from '../transport/websocket.js';
 import { timerDelay } from '../util/timers.js';
+import type { PemInput } from '../util/pem.js';
 
 /** PEM material: one item or several (a chain, several CAs). */
-type Pem = string | Buffer | readonly (string | Buffer)[];
 
 /**
  * TLS settings of a charge point for `wss://` (Security Profiles 2 and 3).
@@ -21,9 +21,9 @@ export interface ChargePointTlsOptions {
    * CAs to trust instead of the system store: only a server certificate issued by one of them is
    * accepted, which pins the Central System's CA.
    */
-  readonly ca?: Pem;
+  readonly ca?: PemInput;
   /** Client certificate, optionally followed by intermediates (Security Profile 3). */
-  readonly cert?: Pem;
+  readonly cert?: PemInput;
   /** Private key of the client certificate. */
   readonly key?: string | Buffer;
   /** Passphrase of an encrypted key. */

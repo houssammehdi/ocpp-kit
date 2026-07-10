@@ -38,7 +38,10 @@ export function ciEquals(a: string, b: string): boolean {
   return a === b || ciKey(a) === ciKey(b);
 }
 
-type LiteralTuple<T extends readonly string[]> = { -readonly [K in keyof T]: TLiteral<T[K]> };
+/** A tuple of string literal schemas, one per value of `T` (see {@link StringEnum}). */
+export type LiteralTuple<T extends readonly string[]> = {
+  -readonly [K in keyof T]: TLiteral<T[K]>;
+};
 
 /** A string enumeration, statically typed as a union of string literals. */
 export function StringEnum<const T extends readonly [string, ...string[]]>(

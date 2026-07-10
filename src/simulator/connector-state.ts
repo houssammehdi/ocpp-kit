@@ -47,7 +47,8 @@ export type ConnectorEvent =
   | 'makeUnavailable'
   | 'makeAvailable';
 
-type TransitionTable = Readonly<
+/** For every event, the status each status moves to; statuses not listed refuse the event. */
+export type TransitionTable = Readonly<
   Record<ConnectorEvent, Readonly<Partial<Record<ConnectorStatus, ConnectorStatus>>>>
 >;
 

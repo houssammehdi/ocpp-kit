@@ -1,0 +1,22 @@
+{
+  "$schema": "https://typedoc.org/schema.json",
+  "entryPoints": ["src/index.ts"],
+  "out": "docs/api",
+  "name": "ocpp-kit",
+  "readme": "none",
+  "excludePrivate": true,
+  "excludeInternal": true,
+  "treatWarningsAsErrors": true,
+  "validation": {
+    "notExported": true,
+    "invalidLink": true,
+    "notDocumented": false
+  },
+  "githubPages": false,
+  "excludeProtected": true,
+  "externalSymbolLinkMappings": {
+    "@types/node": {
+      "EventEmitter": "https://nodejs.org/api/events.html#class-eventemitter"
+    }
+  }
+}

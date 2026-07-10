@@ -51,6 +51,7 @@
     "format": "prettier --write .",
     "format:check": "prettier --check .",
     "bench": "tsx bench/run.ts",
+    "docs": "typedoc",
     "example:csms": "tsx examples/basic-csms.ts",
     "example:charge-point": "tsx examples/basic-charge-point.ts",
     "example:smart-charging": "tsx examples/smart-charging.ts"
@@ -69,6 +70,7 @@
     "prettier": "^3.9.9",
     "tsup": "^8.5.1",
     "tsx": "^4.23.15",
+    "typedoc": "0.28.20",
     "typescript": "~5.9.3",
     "typescript-eslint": "^8.70.1",
     "vitest": "^4.1.11"

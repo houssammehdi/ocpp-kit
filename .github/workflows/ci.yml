@@ -27,6 +27,8 @@ jobs:
       - run: npm run typecheck
       - run: npm test
       - run: npm run build
+      - name: Build the API documentation (warnings fail the build)
+        run: npm run docs
       - name: Check that the benchmarks run (the numbers mean nothing on shared runners)
         run: npm run bench -- --quick
       - name: Smoke-test the CLI

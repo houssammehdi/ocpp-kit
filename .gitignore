@@ -7,3 +7,4 @@ coverage/
 .env
 .env.*
 .ocpp-kit-queue*
+docs/api/

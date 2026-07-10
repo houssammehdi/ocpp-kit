@@ -16,6 +16,7 @@ import {
 import type { ActionName, RequestOf, ResponseOf } from '../rpc/validation.js';
 import { OCPP16_SUBPROTOCOL } from '../transport/websocket.js';
 import { TypedEventEmitter } from '../util/typed-emitter.js';
+import type { PemInput } from '../util/pem.js';
 import { timerDelay } from '../util/timers.js';
 import { parseBasicAuth, type Authenticator } from './auth.js';
 import { certificateMatchesIdentity, type CertificateIdentityBinding } from './certificates.js';
@@ -24,8 +25,7 @@ import { ChargePointConnection, type CentralSystemHandlerContext } from './conne
 type Inbound = typeof ChargePointToCentralSystem;
 type Outbound = typeof CentralSystemToChargePoint;
 
-/** PEM material: one item or several (e.g. a certificate chain or several CAs). */
-export type PemInput = string | Buffer | readonly (string | Buffer)[];
+export type { PemInput } from '../util/pem.js';
 
 /**
  * TLS server settings for Security Profiles 2 and 3 (`wss://`). {@link CentralSystem.listen}
