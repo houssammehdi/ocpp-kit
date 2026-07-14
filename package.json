@@ -1,7 +1,7 @@
 {
   "name": "ocpp-kit",
-  "version": "0.1.0",
-  "description": "Type-safe OCPP 1.6-J toolkit for Node.js: RPC framing, Central System server, Charge Point client and a charge-point simulator for load testing.",
+  "version": "0.2.0",
+  "description": "Type-safe OCPP 1.6-J toolkit for Node.js: RPC framing, Central System server, Charge Point client, a charge-point simulator for load testing and a conformance checker for Central Systems.",
   "keywords": [
     "ocpp",
     "ocpp16",
@@ -11,7 +11,8 @@
     "charge-point",
     "websocket",
     "simulator",
-    "typescript"
+    "typescript",
+    "conformance"
   ],
   "license": "MIT",
   "author": "Houssam Mehdi",
@@ -38,6 +39,7 @@
   "files": [
     "dist",
     "README.md",
+    "CHANGELOG.md",
     "LICENSE"
   ],
   "sideEffects": false,
