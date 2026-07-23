@@ -310,4 +310,54 @@ describe('ChargingProfileManager.compositeSchedule', () => {
       { startPeriod: 36 * 3_600, limit: 6 },
     ]);
   });
+
+  it('never reports two periods with the same startPeriod (regression)', () => {
+    // A transaction started at .600 and an absolute schedule on whole seconds put two
+    // breakpoints within one second of each other: 5.6 s and 6 s after "now".
+    const m = new ChargingProfileManager({ connectors: 1 });
+    const now = new Date('2026-05-01T12:00:05.000Z');
+    const running = { transactionId: 1, startedAt: new Date('2026-05-01T12:00:00.600Z') };
+    m.set(
+      1,
+      profile({
+        chargingSchedule: {
+          chargingRateUnit: 'W',
+          chargingSchedulePeriod: [
+            { startPeriod: 0, limit: 5_000 },
+            { startPeriod: 10, limit: 4_000 },
+          ],
+        },
+      }),
+      running,
+      now,
+    );
+    m.set(
+      0,
+      profile({
+        chargingProfileId: 2,
+        chargingProfilePurpose: 'ChargePointMaxProfile',
+        chargingProfileKind: 'Absolute',
+        chargingSchedule: {
+          startSchedule: '2026-05-01T12:00:00.000Z',
+          chargingRateUnit: 'W',
+          chargingSchedulePeriod: [
+            { startPeriod: 0, limit: 9_000 },
+            { startPeriod: 11, limit: 3_000 },
+          ],
+        },
+      }),
+      undefined,
+      now,
+    );
+    const result = m.compositeSchedule(1, 60, {
+      now,
+      transaction: running,
+      hardwareMaxW: 22_000,
+      spec,
+    });
+    expect(result.chargingSchedule?.chargingSchedulePeriod).toEqual([
+      { startPeriod: 0, limit: 5_000 },
+      { startPeriod: 6, limit: 3_000 },
+    ]);
+  });
 });

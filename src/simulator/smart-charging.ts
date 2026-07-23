@@ -364,10 +364,14 @@ export class ChargingProfileManager {
         Math.round(
           fromWatts(limit?.watts ?? options.hardwareMaxW, unit, phases, options.spec) * 10,
         ) / 10;
+      const startPeriod = Math.round((time - now.getTime()) / 1_000);
+      // Breakpoints less than a second apart round to the same startPeriod; startPeriods must
+      // increase, so the later limit (the one that holds from then on) takes the slot.
+      if (periods.at(-1)?.startPeriod === startPeriod) periods.pop();
       const previous = periods.at(-1);
       if (previous?.limit === value && previous.numberPhases === limit?.numberPhases) continue;
       periods.push({
-        startPeriod: Math.round((time - now.getTime()) / 1_000),
+        startPeriod,
         limit: value,
         ...(limit?.numberPhases === undefined ? {} : { numberPhases: limit.numberPhases }),
       });
