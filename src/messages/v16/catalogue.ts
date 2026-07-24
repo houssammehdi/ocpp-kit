@@ -1,3 +1,5 @@
+import { OCPP16_ERROR_CODES } from '../../rpc/errors.js';
+import type { OcppProtocol } from '../../rpc/protocol.js';
 import type { ActionName, RequestOf, ResponseOf } from '../../rpc/validation.js';
 import * as core from './core.js';
 import * as fw from './firmware.js';
@@ -199,3 +201,18 @@ const TRANSACTION_ACTIONS: ReadonlySet<string> = new Set<TransactionAction>([
 export function isTransactionAction(action: string): action is TransactionAction {
   return TRANSACTION_ACTIONS.has(action);
 }
+
+/** OCPP 1.6-J as a protocol definition for the version-generic layers. */
+export const OCPP16_PROTOCOL: OcppProtocol<
+  '1.6',
+  ChargePointToCentralSystem,
+  CentralSystemToChargePoint
+> = {
+  version: '1.6',
+  name: 'OCPP 1.6-J',
+  subprotocol: 'ocpp1.6',
+  errorCodes: OCPP16_ERROR_CODES,
+  fromChargePoint: ChargePointToCentralSystem,
+  fromCentralSystem: CentralSystemToChargePoint,
+  transactionActions: ['StartTransaction', 'StopTransaction', 'MeterValues'],
+};
