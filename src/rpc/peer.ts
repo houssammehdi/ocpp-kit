@@ -2,7 +2,15 @@ import { randomUUID } from 'node:crypto';
 import { TypedEventEmitter } from '../util/typed-emitter.js';
 import { timerDelay } from '../util/timers.js';
 import type { Duplex } from './duplex.js';
-import { CallAbortedError, CallTimeoutError, ConnectionClosedError, RpcError } from './errors.js';
+import {
+  CallAbortedError,
+  CallTimeoutError,
+  ConnectionClosedError,
+  OCPP16_ERROR_CODES,
+  RpcError,
+  translateErrorCode,
+  type ErrorCodeSet,
+} from './errors.js';
 import {
   callErrorFrame,
   MessageType,
@@ -98,6 +106,11 @@ export interface RpcPeerOptions<
   readonly validateOutbound?: boolean;
   /** Message id generator. Must return unique strings of at most 36 characters. Default: UUID v4. */
   readonly generateId?: () => string;
+  /**
+   * The error codes of the protocol version spoken on this channel, used for every CALLERROR the
+   * peer sends and to interpret the ones it receives. Default: {@link OCPP16_ERROR_CODES}.
+   */
+  readonly errorCodes?: ErrorCodeSet;
 }
 
 /** Options of a single {@link RpcPeer.call}. */
@@ -193,6 +206,7 @@ export class RpcPeer<
   readonly #validateInbound: boolean;
   readonly #validateOutbound: boolean;
   readonly #generateId: () => string;
+  readonly #errors: ErrorCodeSet;
   readonly #queue: PendingCall[] = [];
   #inFlight: InFlightCall | undefined;
   #closed = false;
@@ -212,6 +226,7 @@ export class RpcPeer<
     this.#validateInbound = options.validateInbound ?? true;
     this.#validateOutbound = options.validateOutbound ?? true;
     this.#generateId = options.generateId ?? randomUUID;
+    this.#errors = options.errorCodes ?? OCPP16_ERROR_CODES;
     duplex.attach({
       message: (data) => {
         this.#onMessage(data);
@@ -230,6 +245,11 @@ export class RpcPeer<
   /** Number of calls waiting behind the outstanding one. */
   get queueLength(): number {
     return this.#queue.length;
+  }
+
+  /** The error codes this peer uses. */
+  get errorCodes(): ErrorCodeSet {
+    return this.#errors;
   }
 
   /** Whether a CALL is currently awaiting its response. */
@@ -256,7 +276,9 @@ export class RpcPeer<
   ): Promise<ResponseOf<Out, A>> {
     const schema = Object.hasOwn(this.#outbound, action) ? this.#outbound[action] : undefined;
     if (!schema) {
-      return Promise.reject(new RpcError('NotImplemented', `Unknown outbound action ${action}`));
+      return Promise.reject(
+        new RpcError(this.#errors.notImplemented, `Unknown outbound action ${action}`),
+      );
     }
     if (this.#closed) {
       return Promise.reject(
@@ -264,7 +286,7 @@ export class RpcPeer<
       );
     }
     if (this.#validateOutbound) {
-      const error = validatePayload(schema.request, payload, `${action} request`);
+      const error = validatePayload(schema.request, payload, `${action} request`, this.#errors);
       if (error) return Promise.reject(error);
     }
     const { signal } = options;
@@ -380,7 +402,7 @@ export class RpcPeer<
   #onMessage(raw: string): void {
     if (this.#closed) return;
     this.emit('message', 'in', raw);
-    const result = parseFrame(raw);
+    const result = parseFrame(raw, this.#errors);
     if (!result.ok) {
       this.emit('badMessage', raw, result.error);
       const { messageId, messageType } = result;
@@ -424,7 +446,12 @@ export class RpcPeer<
     const { action } = inFlight.call;
     const schema = this.#outbound[action];
     if (this.#validateInbound && schema) {
-      const error = validatePayload(schema.response, frame.payload, `${action} response`);
+      const error = validatePayload(
+        schema.response,
+        frame.payload,
+        `${action} response`,
+        this.#errors,
+      );
       if (error) {
         this.#settle(error);
         return;
@@ -443,7 +470,7 @@ export class RpcPeer<
         callErrorFrame(
           messageId,
           new RpcError(
-            'GenericError',
+            this.#errors.generic,
             `A CALL with message id ${messageId} is already being handled`,
           ),
         ),
@@ -472,15 +499,17 @@ export class RpcPeer<
     const schema = Object.hasOwn(this.#inbound, action) ? this.#inbound[action] : undefined;
     const handler = this.#handlers.get(action);
     if (!schema) {
-      finish({ error: new RpcError('NotImplemented', `Unknown action ${action}`) });
+      finish({ error: new RpcError(this.#errors.notImplemented, `Unknown action ${action}`) });
       return;
     }
     if (!handler) {
-      finish({ error: new RpcError('NotSupported', `Action ${action} is not supported`) });
+      finish({
+        error: new RpcError(this.#errors.notSupported, `Action ${action} is not supported`),
+      });
       return;
     }
     if (this.#validateInbound) {
-      const error = validatePayload(schema.request, payload, `${action} request`);
+      const error = validatePayload(schema.request, payload, `${action} request`, this.#errors);
       if (error) {
         finish({ error });
         return;
@@ -493,17 +522,17 @@ export class RpcPeer<
     } catch (cause) {
       finish(
         cause instanceof RpcError
-          ? { error: cause }
-          : { error: new RpcError('InternalError', `Failed to process ${action}`), cause },
+          ? { error: this.#inVocabulary(cause) }
+          : { error: new RpcError(this.#errors.internal, `Failed to process ${action}`), cause },
       );
       return;
     }
     if (this.#validateOutbound) {
-      const error = validatePayload(schema.response, response, `${action} response`);
+      const error = validatePayload(schema.response, response, `${action} response`, this.#errors);
       if (error) {
         finish({
           error: new RpcError(
-            'InternalError',
+            this.#errors.internal,
             `Produced an invalid ${action} response`,
             error.details,
           ),
@@ -513,10 +542,28 @@ export class RpcPeer<
       }
     }
     if (typeof response !== 'object' || response === null || Array.isArray(response)) {
-      finish({ error: new RpcError('InternalError', `Produced an invalid ${action} response`) });
+      finish({
+        error: new RpcError(this.#errors.internal, `Produced an invalid ${action} response`),
+      });
       return;
     }
     finish({ response: response as JsonObject });
+  }
+
+  /**
+   * A handler's error in this peer's vocabulary: a code of the other OCPP version is translated
+   * (e.g. `FormationViolation` becomes `FormatViolation` on a 2.0.1 connection); a code without
+   * an equivalent becomes `GenericError`, keeping the original in `details.originalErrorCode`.
+   */
+  #inVocabulary(error: RpcError): RpcError {
+    const code = translateErrorCode(error.code, this.#errors);
+    if (code === error.code) return error;
+    return new RpcError(
+      code ?? this.#errors.generic,
+      error.message === error.code ? '' : error.message,
+      code === undefined ? { ...error.details, originalErrorCode: error.code } : error.details,
+      { cause: error },
+    );
   }
 
   #onClose(code: number, reason: string): void {

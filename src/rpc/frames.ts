@@ -1,4 +1,10 @@
-import { isOcppErrorCode, RpcError, type ErrorDetails, type OcppErrorCode } from './errors.js';
+import {
+  OCPP16_ERROR_CODES,
+  RpcError,
+  type ErrorCodeSet,
+  type ErrorDetails,
+  type RpcErrorCode,
+} from './errors.js';
 
 /** OCPP-J message type ids (the first element of every frame). */
 export const MessageType = {
@@ -35,7 +41,7 @@ export interface CallResultFrame {
 export interface CallErrorFrame {
   readonly type: typeof MessageType.CallError;
   readonly messageId: string;
-  readonly errorCode: OcppErrorCode;
+  readonly errorCode: RpcErrorCode;
   readonly errorDescription: string;
   readonly errorDetails: ErrorDetails;
 }
@@ -83,7 +89,7 @@ function isMessageTypeId(value: unknown): value is MessageTypeId {
 }
 
 function fail(
-  code: OcppErrorCode,
+  code: RpcErrorCode,
   description: string,
   context: { messageId?: string | undefined; messageType?: MessageTypeId | undefined } = {},
 ): ParseFailure {
@@ -98,36 +104,43 @@ function fail(
 /**
  * Parse and structurally validate a raw OCPP-J text frame.
  *
- * Error mapping (the specification defines the codes but not how framing faults map onto them,
- * so ocpp-kit uses this deterministic table):
+ * Error mapping (the specifications define the codes but not how framing faults map onto them,
+ * so ocpp-kit uses this deterministic table; the codes are those of `errors`):
  *
- * | Fault                                                     | Code                 |
- * | --------------------------------------------------------- | -------------------- |
- * | not JSON, not an array, id not a string, bad field types  | `FormationViolation` |
- * | message id empty or longer than 36 characters             | `FormationViolation` |
- * | more elements than the message type allows                | `FormationViolation` |
- * | unknown message type id                                   | `ProtocolError`      |
- * | fewer elements than the message type requires             | `ProtocolError`      |
+ * | Fault                                                     | OCPP 1.6             | OCPP 2.0.1          |
+ * | --------------------------------------------------------- | -------------------- | ------------------- |
+ * | not JSON, not an array, id not a string                   | `FormationViolation` | `RpcFrameworkError` |
+ * | message id empty or longer than 36 characters             | `FormationViolation` | `RpcFrameworkError` |
+ * | more elements than the message type allows                | `FormationViolation` | `RpcFrameworkError` |
+ * | action or error fields of the wrong type                  | `FormationViolation` | `RpcFrameworkError` |
+ * | payload or error details not a JSON object                | `FormationViolation` | `FormatViolation`   |
+ * | unknown message type id                                   | `ProtocolError`      | `ProtocolError`     |
+ * | fewer elements than the message type requires             | `ProtocolError`      | `RpcFrameworkError` |
  *
  * {@link RpcPeer} answers a failed CALL with a CALLERROR carrying this code when the message id
- * could be recovered. Frames of an unknown message type are only reported, never answered:
- * OCPP-J 1.6 section 4.1.3 says to ignore them.
+ * could be recovered. Frames of an unknown message type are only reported, never answered: both
+ * OCPP-J 1.6 and 2.0.1 (section 4.1.3) say to ignore them.
+ *
+ * A CALLERROR whose code `errors` does not define is surfaced as `GenericError`, with the
+ * original code in `errorDetails.originalErrorCode`.
+ *
+ * @param errors - the error codes of the protocol version; default OCPP 1.6
  */
-export function parseFrame(raw: string): ParseResult {
+export function parseFrame(raw: string, errors: ErrorCodeSet = OCPP16_ERROR_CODES): ParseResult {
   let decoded: unknown;
   try {
     decoded = JSON.parse(raw);
   } catch {
-    return fail('FormationViolation', 'Message is not valid JSON');
+    return fail(errors.rpcFramework, 'Message is not valid JSON');
   }
   if (!Array.isArray(decoded)) {
-    return fail('FormationViolation', 'Message must be a JSON array');
+    return fail(errors.rpcFramework, 'Message must be a JSON array');
   }
   const frame: unknown[] = decoded;
   const [typeId, messageId] = frame;
   if (typeof messageId !== 'string') {
-    if (frame.length < 2) return fail('ProtocolError', 'Message is incomplete');
-    return fail('FormationViolation', 'Message id must be a string');
+    if (frame.length < 2) return fail(errors.incompleteFrame, 'Message is incomplete');
+    return fail(errors.rpcFramework, 'Message id must be a string');
   }
   if (!isMessageTypeId(typeId)) {
     return fail('ProtocolError', `Unknown message type id: ${JSON.stringify(typeId)}`, {
@@ -137,7 +150,7 @@ export function parseFrame(raw: string): ParseResult {
   const context = { messageId, messageType: typeId };
   if (messageId.length === 0 || messageId.length > MAX_MESSAGE_ID_LENGTH) {
     return fail(
-      'FormationViolation',
+      errors.rpcFramework,
       `Message id must be 1-${MAX_MESSAGE_ID_LENGTH} characters long`,
       context,
     );
@@ -145,14 +158,14 @@ export function parseFrame(raw: string): ParseResult {
   const expectedLength = FRAME_LENGTH[typeId];
   if (frame.length < expectedLength) {
     return fail(
-      'ProtocolError',
+      errors.incompleteFrame,
       `Message is incomplete: expected ${expectedLength} elements, got ${frame.length}`,
       context,
     );
   }
   if (frame.length > expectedLength) {
     return fail(
-      'FormationViolation',
+      errors.rpcFramework,
       `Message has too many elements: expected ${expectedLength}, got ${frame.length}`,
       context,
     );
@@ -162,39 +175,39 @@ export function parseFrame(raw: string): ParseResult {
     case MessageType.Call: {
       const [, , action, payload] = frame;
       if (typeof action !== 'string' || action.length === 0) {
-        return fail('FormationViolation', 'Action must be a non-empty string', context);
+        return fail(errors.rpcFramework, 'Action must be a non-empty string', context);
       }
       if (!isJsonObject(payload)) {
-        return fail('FormationViolation', 'Payload must be a JSON object', context);
+        return fail(errors.format, 'Payload must be a JSON object', context);
       }
       return { ok: true, frame: { type: typeId, messageId, action, payload } };
     }
     case MessageType.CallResult: {
       const [, , payload] = frame;
       if (!isJsonObject(payload)) {
-        return fail('FormationViolation', 'Payload must be a JSON object', context);
+        return fail(errors.format, 'Payload must be a JSON object', context);
       }
       return { ok: true, frame: { type: typeId, messageId, payload } };
     }
     case MessageType.CallError: {
       const [, , errorCode, errorDescription, errorDetails] = frame;
       if (typeof errorCode !== 'string') {
-        return fail('FormationViolation', 'Error code must be a string', context);
+        return fail(errors.rpcFramework, 'Error code must be a string', context);
       }
       if (typeof errorDescription !== 'string') {
-        return fail('FormationViolation', 'Error description must be a string', context);
+        return fail(errors.rpcFramework, 'Error description must be a string', context);
       }
       if (!isJsonObject(errorDetails)) {
-        return fail('FormationViolation', 'Error details must be a JSON object', context);
+        return fail(errors.format, 'Error details must be a JSON object', context);
       }
       // Unknown codes from non-compliant peers are surfaced as GenericError, keeping the original.
-      const known = isOcppErrorCode(errorCode);
+      const known = (errors.codes as readonly string[]).includes(errorCode);
       return {
         ok: true,
         frame: {
           type: typeId,
           messageId,
-          errorCode: known ? errorCode : 'GenericError',
+          errorCode: known ? (errorCode as RpcErrorCode) : errors.generic,
           errorDescription,
           errorDetails: known ? errorDetails : { ...errorDetails, originalErrorCode: errorCode },
         },

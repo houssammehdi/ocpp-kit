@@ -3,3 +3,4 @@ export * from './frames.js';
 export * from './duplex.js';
 export * from './validation.js';
 export * from './peer.js';
+export * from './protocol.js';
