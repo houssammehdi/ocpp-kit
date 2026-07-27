@@ -4,7 +4,12 @@ import type { AddressInfo } from 'node:net';
 import type { Duplex as NodeDuplex } from 'node:stream';
 import type { PeerCertificate, SecureVersion, TLSSocket } from 'node:tls';
 import { WebSocketServer, type WebSocket } from 'ws';
-import type { CentralSystemToChargePoint, ChargePointToCentralSystem } from '../messages/index.js';
+import type {
+  CentralSystemToChargePoint,
+  ChargePointToCentralSystem,
+  ChargingStationToCsms,
+  CsmsToChargingStation,
+} from '../messages/index.js';
 import { RpcError } from '../rpc/errors.js';
 import type { JsonObject } from '../rpc/frames.js';
 import {
@@ -13,17 +18,60 @@ import {
   type CompletedCallEvent,
   type RequestHandler,
 } from '../rpc/peer.js';
-import type { ActionName, RequestOf, ResponseOf } from '../rpc/validation.js';
-import { OCPP16_SUBPROTOCOL } from '../transport/websocket.js';
+import type { ActionName, ActionSchemaMap, RequestOf, ResponseOf } from '../rpc/validation.js';
+import {
+  OCPP16_SUBPROTOCOL,
+  OCPP201_SUBPROTOCOL,
+  type OcppSubprotocol,
+} from '../transport/websocket.js';
 import { TypedEventEmitter } from '../util/typed-emitter.js';
 import type { PemInput } from '../util/pem.js';
 import { timerDelay } from '../util/timers.js';
 import { parseBasicAuth, type Authenticator } from './auth.js';
 import { certificateMatchesIdentity, type CertificateIdentityBinding } from './certificates.js';
-import { ChargePointConnection, type CentralSystemHandlerContext } from './connection.js';
+import {
+  ChargePointConnection,
+  ChargingStationConnection,
+  type AnyConnection,
+  type CentralSystemHandlerContext,
+  type CsmsHandlerContext,
+} from './connection.js';
 
 type Inbound = typeof ChargePointToCentralSystem;
 type Outbound = typeof CentralSystemToChargePoint;
+type Inbound201 = typeof ChargingStationToCsms;
+type Outbound201 = typeof CsmsToChargingStation;
+
+/** The connection class of each subprotocol. */
+export interface ConnectionBySubprotocol {
+  readonly 'ocpp1.6': ChargePointConnection;
+  readonly 'ocpp2.0.1': ChargingStationConnection;
+}
+
+/** The connection type of a subprotocol (or of a union of them). */
+export type ConnectionOf<P extends OcppSubprotocol> = ConnectionBySubprotocol[P];
+
+/**
+ * The handlers and calls of one OCPP version of a {@link CentralSystem}: `cs.v16` and `cs.v201`.
+ * Both work whatever the server accepts; handlers of a version it does not accept never run.
+ */
+export interface VersionEndpoint<In extends ActionSchemaMap, Out extends ActionSchemaMap, C> {
+  /** Register (or replace) the handler for an action the charge point initiates. */
+  handle<A extends ActionName<In>>(
+    action: A,
+    handler: RequestHandler<In, A, C & object>,
+  ): VersionEndpoint<In, Out, C>;
+  /**
+   * Send a typed CALL to a connected charge point of this version. Rejects when it is not
+   * connected or speaks another version.
+   */
+  call<A extends ActionName<Out>>(
+    identity: string,
+    action: A,
+    payload: RequestOf<Out, A>,
+    options?: CallOptions,
+  ): Promise<ResponseOf<Out, A>>;
+}
 
 export type { PemInput } from '../util/pem.js';
 
@@ -65,7 +113,13 @@ export interface ClientCertificateOptions {
 }
 
 /** Options of {@link CentralSystem}. */
-export interface CentralSystemOptions {
+export interface CentralSystemOptions<P extends OcppSubprotocol = 'ocpp1.6'> {
+  /**
+   * WebSocket subprotocols to accept, in order of preference: when a charge point offers several,
+   * the first of this list that it offers wins. `['ocpp2.0.1', 'ocpp1.6']` serves both versions
+   * on one port. Default: `['ocpp1.6']`.
+   */
+  readonly protocols?: readonly P[];
   /**
    * URL path prefix. The charge point identity is the single path segment following it, e.g.
    * with `basePath: '/ocpp'` a charge point connects to `ws://host/ocpp/CP-001`. Default: `/`.
@@ -116,8 +170,8 @@ export type RejectionReason =
   'path' | 'auth' | 'certificate' | 'subprotocol' | 'duplicate' | 'shutdown';
 
 /** Emitted after an inbound CALL from a charge point was answered. */
-export interface CentralSystemCallEvent {
-  readonly connection: ChargePointConnection;
+export interface CentralSystemCallEvent<C extends AnyConnection = ChargePointConnection> {
+  readonly connection: C;
   readonly action: string;
   readonly messageId: string;
   readonly request: JsonObject;
@@ -129,20 +183,25 @@ export interface CentralSystemCallEvent {
 }
 
 /** Emitted after a CALL sent to a charge point settled (answered, failed or timed out). */
-export interface CentralSystemCallCompletedEvent extends CompletedCallEvent {
-  readonly connection: ChargePointConnection;
+export interface CentralSystemCallCompletedEvent<
+  C extends AnyConnection = ChargePointConnection,
+> extends CompletedCallEvent {
+  readonly connection: C;
 }
 
-/** Events emitted by {@link CentralSystem}. */
-export interface CentralSystemEvents {
-  connect: (connection: ChargePointConnection) => void;
-  disconnect: (connection: ChargePointConnection, code: number, reason: string) => void;
+/**
+ * Events emitted by {@link CentralSystem}. `C` is the connection type: `ChargePointConnection`
+ * for a 1.6-only server, a union discriminated by `version` for a multi-version one.
+ */
+export interface CentralSystemEvents<C extends AnyConnection = ChargePointConnection> {
+  connect: (connection: C) => void;
+  disconnect: (connection: C, code: number, reason: string) => void;
   /** An inbound CALL from a charge point was answered. */
-  call: (event: CentralSystemCallEvent) => void;
+  call: (event: CentralSystemCallEvent<C>) => void;
   /** A CALL sent to a charge point settled, with its round-trip time. */
-  callCompleted: (event: CentralSystemCallCompletedEvent) => void;
+  callCompleted: (event: CentralSystemCallCompletedEvent<C>) => void;
   /** Raw frame traffic of every connection, for protocol logging. */
-  message: (connection: ChargePointConnection, direction: 'in' | 'out', raw: string) => void;
+  message: (connection: C, direction: 'in' | 'out', raw: string) => void;
   rejected: (info: {
     readonly reason: RejectionReason;
     readonly identity: string | undefined;
@@ -150,7 +209,7 @@ export interface CentralSystemEvents {
     /** Why, when there is more to say than the reason (e.g. which certificate check failed). */
     readonly detail?: string;
   }) => void;
-  badMessage: (connection: ChargePointConnection, raw: string, error: RpcError) => void;
+  badMessage: (connection: C, raw: string, error: RpcError) => void;
 }
 
 /** Options of {@link CentralSystem.close}. */
@@ -190,33 +249,57 @@ function refuse(socket: NodeDuplex, status: number, message: string, headers: st
 }
 
 /**
- * An OCPP 1.6-J Central System (CSMS) WebSocket server.
+ * An OCPP-J Central System (CSMS) WebSocket server for OCPP 1.6 and 2.0.1.
+ *
+ * By default it speaks OCPP 1.6 only. With `protocols: ['ocpp2.0.1', 'ocpp1.6']` it serves both
+ * versions on the same port: the subprotocol negotiated in the handshake decides, per
+ * connection, which catalogue and error codes apply. `cs.handle()` and `cs.call()` are the
+ * OCPP 1.6 API (also available as `cs.v16`); `cs.v201` is the OCPP 2.0.1 one. Connections carry
+ * their `version`.
  *
  * ```ts
- * const cs = new CentralSystem();
+ * const cs = new CentralSystem({ protocols: ['ocpp2.0.1', 'ocpp1.6'] });
  * cs.handle('BootNotification', () => ({ status: 'Accepted', currentTime: new Date().toISOString(), interval: 300 }));
- * cs.on('connect', (cp) => console.log(`${cp.identity} connected`));
+ * cs.v201.handle('BootNotification', () => ({ status: 'Accepted', currentTime: new Date().toISOString(), interval: 300 }));
+ * cs.on('connect', (cp) => console.log(`${cp.identity} connected with OCPP ${cp.version}`));
  * await cs.listen(9220);
  * ```
+ *
+ * @typeParam P - the accepted subprotocols
  */
-export class CentralSystem extends TypedEventEmitter<CentralSystemEvents> {
+export class CentralSystem<P extends OcppSubprotocol = 'ocpp1.6'> extends TypedEventEmitter<
+  CentralSystemEvents<ConnectionOf<P>>
+> {
+  /** The OCPP 1.6 handlers and calls (`cs.handle()` and `cs.call()` are shortcuts). */
+  readonly v16: VersionEndpoint<Inbound, Outbound, CentralSystemHandlerContext>;
+  /** The OCPP 2.0.1 handlers and calls. */
+  readonly v201: VersionEndpoint<Inbound201, Outbound201, CsmsHandlerContext>;
   readonly #options: Required<
-    Omit<CentralSystemOptions, 'authenticate' | 'tls' | 'clientCertificates'>
+    Omit<CentralSystemOptions<P>, 'authenticate' | 'tls' | 'clientCertificates'>
   > &
-    Pick<CentralSystemOptions, 'authenticate' | 'tls' | 'clientCertificates'>;
+    Pick<CentralSystemOptions<P>, 'authenticate' | 'tls' | 'clientCertificates'>;
   readonly #handlers = new HandlerRegistry<Inbound, CentralSystemHandlerContext>();
-  readonly #connections = new Map<string, ChargePointConnection>();
+  readonly #handlers201 = new HandlerRegistry<Inbound201, CsmsHandlerContext>();
+  readonly #connections = new Map<string, AnyConnection>();
   readonly #wss: WebSocketServer;
   #ownServer: Server | undefined;
   #pingTimer: NodeJS.Timeout | undefined;
-  readonly #alive = new WeakSet<ChargePointConnection>();
-  /** Identities whose latest BootNotification was accepted. */
+  readonly #alive = new WeakSet<AnyConnection>();
+  /** `<subprotocol> <identity>` of charge points whose latest BootNotification was accepted. */
   readonly #registered = new Set<string>();
   #closing = false;
 
-  constructor(options: CentralSystemOptions = {}) {
+  constructor(options: CentralSystemOptions<P> = {}) {
     super();
+    const protocols = options.protocols ?? (['ocpp1.6'] as readonly OcppSubprotocol[] as P[]);
+    if (protocols.length === 0) throw new RangeError('protocols must not be empty');
+    for (const protocol of protocols) {
+      if (protocol !== OCPP16_SUBPROTOCOL && protocol !== OCPP201_SUBPROTOCOL) {
+        throw new RangeError(`Unsupported subprotocol ${String(protocol)}`);
+      }
+    }
     this.#options = {
+      protocols,
       basePath: normaliseBasePath(options.basePath ?? DEFAULTS.basePath),
       authenticate: options.authenticate,
       tls: options.tls,
@@ -233,28 +316,96 @@ export class CentralSystem extends TypedEventEmitter<CentralSystemEvents> {
       noServer: true,
       maxPayload: this.#options.maxPayloadBytes,
       clientTracking: false,
-      handleProtocols: (protocols) =>
-        protocols.has(OCPP16_SUBPROTOCOL) ? OCPP16_SUBPROTOCOL : false,
+      // The first subprotocol of our preference list that the charge point offers.
+      handleProtocols: (offered) => protocols.find((protocol) => offered.has(protocol)) ?? false,
     });
+    this.v16 = this.#endpoint(this.#handlers, '1.6');
+    this.v201 = this.#endpoint(this.#handlers201, '2.0.1');
+  }
+
+  /** The accepted subprotocols, in order of preference. */
+  get protocols(): readonly P[] {
+    return this.#options.protocols;
   }
 
   /** Currently connected charge points, keyed by identity. */
-  get connections(): ReadonlyMap<string, ChargePointConnection> {
-    return this.#connections;
+  get connections(): ReadonlyMap<string, ConnectionOf<P>> {
+    return this.#connections as unknown as ReadonlyMap<string, ConnectionOf<P>>;
   }
 
   /**
-   * Register the handler for a Charge Point initiated action. Handlers receive the typed request
-   * and a context holding the {@link ChargePointConnection}; they return the typed response.
+   * Register the handler for an OCPP 1.6 Charge Point initiated action. Handlers receive the
+   * typed request and a context holding the {@link ChargePointConnection}; they return the typed
+   * response. For OCPP 2.0.1 use `cs.v201.handle()`.
    */
   handle<A extends ActionName<Inbound>>(
     action: A,
     handler: RequestHandler<Inbound, A, CentralSystemHandlerContext>,
   ): this {
-    const guarded: RequestHandler<Inbound, A, CentralSystemHandlerContext> = async (
-      payload,
-      context,
-    ) => {
+    this.v16.handle(action, handler);
+    return this;
+  }
+
+  /**
+   * Send a typed OCPP 1.6 CALL to a connected charge point. Rejects when it is not connected or
+   * speaks OCPP 2.0.1 (use `cs.v201.call()` for those).
+   */
+  call<A extends ActionName<Outbound>>(
+    identity: string,
+    action: A,
+    payload: RequestOf<Outbound, A>,
+    options?: CallOptions,
+  ): Promise<ResponseOf<Outbound, A>> {
+    return this.v16.call(identity, action, payload, options);
+  }
+
+  /** The handler registration and calls of one version. */
+  #endpoint<In extends ActionSchemaMap, Out extends ActionSchemaMap, C extends object>(
+    registry: HandlerRegistry<In, C & { readonly connection: AnyConnection }>,
+    version: AnyConnection['version'],
+  ): VersionEndpoint<In, Out, C & { readonly connection: AnyConnection }> {
+    const endpoint: VersionEndpoint<In, Out, C & { readonly connection: AnyConnection }> = {
+      handle: (action, handler) => {
+        registry.set(action, this.#guard(action, handler));
+        return endpoint;
+      },
+      call: (identity, action, payload, options) => {
+        const connection = this.#connections.get(identity);
+        if (!connection) {
+          return Promise.reject(
+            new RpcError('GenericError', `Charge point ${identity} is not connected`),
+          );
+        }
+        if (connection.version !== version) {
+          return Promise.reject(
+            new RpcError(
+              'GenericError',
+              `Charge point ${identity} speaks OCPP ${connection.version}, not ${version}`,
+            ),
+          );
+        }
+        const peer = connection.peer as unknown as {
+          call(
+            action: string,
+            payload: unknown,
+            options?: CallOptions,
+          ): Promise<ResponseOf<Out, typeof action>>;
+        };
+        return peer.call(action, payload, options);
+      },
+    };
+    return endpoint;
+  }
+
+  /**
+   * Wrap a handler with the registration rules shared by both versions: `requireAcceptedBoot`
+   * and the bookkeeping of BootNotification answers (both versions answer with a `status`).
+   */
+  #guard<In extends ActionSchemaMap, A extends ActionName<In>, C extends object>(
+    action: A,
+    handler: RequestHandler<In, A, C & { readonly connection: AnyConnection }>,
+  ): RequestHandler<In, A, C & { readonly connection: AnyConnection }> {
+    return async (payload, context) => {
       const { connection } = context;
       if (
         this.#options.requireAcceptedBoot &&
@@ -265,33 +416,15 @@ export class CentralSystem extends TypedEventEmitter<CentralSystemEvents> {
       }
       const response = await handler(payload, context);
       if (action === 'BootNotification') {
-        connection.lastBootNotification = payload as RequestOf<Inbound, 'BootNotification'>;
-        const accepted =
-          (response as ResponseOf<Inbound, 'BootNotification'>).status === 'Accepted';
-        if (accepted) this.#registered.add(connection.identity);
-        else this.#registered.delete(connection.identity);
+        (connection as { lastBootNotification: unknown }).lastBootNotification = payload;
+        const accepted = (response as { readonly status: string }).status === 'Accepted';
+        const key = `${connection.protocol} ${connection.identity}`;
+        if (accepted) this.#registered.add(key);
+        else this.#registered.delete(key);
         connection.bootAccepted = accepted;
       }
       return response;
     };
-    this.#handlers.set(action, guarded);
-    return this;
-  }
-
-  /** Send a typed CALL to a connected charge point. Rejects when it is not connected. */
-  call<A extends ActionName<Outbound>>(
-    identity: string,
-    action: A,
-    payload: RequestOf<Outbound, A>,
-    options?: CallOptions,
-  ): Promise<ResponseOf<Outbound, A>> {
-    const connection = this.#connections.get(identity);
-    if (!connection) {
-      return Promise.reject(
-        new RpcError('GenericError', `Charge point ${identity} is not connected`),
-      );
-    }
-    return connection.call(action, payload, options);
   }
 
   /**
@@ -303,7 +436,9 @@ export class CentralSystem extends TypedEventEmitter<CentralSystemEvents> {
     if (this.#ownServer) throw new Error('CentralSystem is already listening');
     const answerPlainHttp = (_request: IncomingMessage, response: ServerResponse): void => {
       response.writeHead(426, { 'Content-Type': 'text/plain', Upgrade: 'websocket' });
-      response.end('OCPP 1.6-J endpoint: connect with a WebSocket client\n');
+      response.end(
+        `OCPP-J endpoint (${this.#options.protocols.join(', ')}): connect with a WebSocket client\n`,
+      );
     };
     const { tls, clientCertificates } = this.#options;
     const server: Server | HttpsServer = tls
@@ -497,43 +632,59 @@ export class CentralSystem extends TypedEventEmitter<CentralSystemEvents> {
 
   #onConnection(ws: WebSocket, request: IncomingMessage, identity: string): void {
     ws.on('error', () => undefined);
-    if (ws.protocol !== OCPP16_SUBPROTOCOL) {
+    const protocol = this.#options.protocols.find((candidate) => candidate === ws.protocol);
+    if (protocol === undefined) {
       // OCPP-J: complete the handshake without a subprotocol, then close immediately.
       this.emit('rejected', {
         reason: 'subprotocol',
         identity,
         remoteAddress: request.socket.remoteAddress,
       });
-      ws.close(1002, `Subprotocol ${OCPP16_SUBPROTOCOL} is required`);
+      ws.close(1002, `Subprotocol ${this.#options.protocols.join(' or ')} is required`);
       return;
     }
     const previous = this.#connections.get(identity);
     if (previous) void previous.close(4000, 'Replaced by a new connection');
 
-    const connection = new ChargePointConnection(ws, identity, request, {
-      handlers: this.#handlers,
-      bootAccepted: this.#registered.has(identity),
+    const common = {
+      bootAccepted: this.#registered.has(`${protocol} ${identity}`),
       callTimeoutMs: this.#options.callTimeoutMs,
       validateInbound: this.#options.validateInbound,
       validateOutbound: this.#options.validateOutbound,
-    });
+    };
+    const connection: AnyConnection =
+      protocol === OCPP201_SUBPROTOCOL
+        ? new ChargingStationConnection(ws, identity, request, {
+            ...common,
+            handlers: this.#handlers201,
+          })
+        : new ChargePointConnection(ws, identity, request, { ...common, handlers: this.#handlers });
+    this.#track(connection, ws);
+  }
+
+  /** Register a new connection and forward its events. */
+  #track(anyConnection: AnyConnection, ws: WebSocket): void {
+    const connection = anyConnection as ConnectionOf<P>;
+    const { identity } = connection;
+    // The peer's own type differs per version; its events do not.
+    const peer = connection.peer as unknown as ChargePointConnection['peer'];
     this.#connections.set(identity, connection);
     this.#alive.add(connection);
     ws.on('pong', () => this.#alive.add(connection));
-    connection.peer.on('message', () => this.#alive.add(connection));
-    connection.peer.on('callHandled', (event) => {
+    peer.on('message', () => this.#alive.add(connection));
+    peer.on('callHandled', (event) => {
       this.emit('call', { connection, ...event });
     });
-    connection.peer.on('callCompleted', (event) => {
+    peer.on('callCompleted', (event) => {
       this.emit('callCompleted', { connection, ...event });
     });
-    connection.peer.on('message', (direction, raw) => {
+    peer.on('message', (direction, raw) => {
       this.emit('message', connection, direction, raw);
     });
-    connection.peer.on('badMessage', (raw, error) => {
+    peer.on('badMessage', (raw, error) => {
       this.emit('badMessage', connection, raw, error);
     });
-    connection.peer.once('close', (code, reason) => {
+    peer.once('close', (code, reason) => {
       if (this.#connections.get(identity) === connection) this.#connections.delete(identity);
       this.emit('disconnect', connection, code, reason);
     });

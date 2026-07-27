@@ -1,5 +1,10 @@
 import { RpcError } from '../rpc/errors.js';
 import type { CentralSystem, CentralSystemEvents } from '../server/central-system.js';
+import type { AnyConnection } from '../server/connection.js';
+import type { OcppSubprotocol } from '../transport/websocket.js';
+
+/** Events of a Central System accepting either version. */
+type Events = CentralSystemEvents<AnyConnection>;
 
 /** Severity of a {@link LogEntry}. */
 export type LogLevel = 'debug' | 'info' | 'warn' | 'error';
@@ -16,6 +21,8 @@ export interface LogEntry {
   readonly event: LogEvent;
   /** Charge point identity. */
   readonly identity?: string;
+  /** OCPP version of the connection, for `connect` entries. */
+  readonly version?: string;
   readonly remoteAddress?: string;
   readonly action?: string;
   readonly messageId?: string;
@@ -50,24 +57,27 @@ export interface AttachLoggerOptions {
  *
  * @returns a function that detaches the logger.
  */
-export function attachLogger(
-  cs: CentralSystem,
+export function attachLogger<P extends OcppSubprotocol>(
+  server: CentralSystem<P>,
   logger: Logger,
   options: AttachLoggerOptions = {},
 ): () => void {
+  // Listeners are written for connections of either version.
+  const cs = server as unknown as CentralSystem<OcppSubprotocol>;
   const time = (): string => new Date().toISOString();
-  const onConnect: CentralSystemEvents['connect'] = (connection) => {
+  const onConnect: Events['connect'] = (connection) => {
     logger({
       time: time(),
       level: 'info',
       event: 'connect',
       identity: connection.identity,
+      version: connection.version,
       ...(connection.remoteAddress === undefined
         ? {}
         : { remoteAddress: connection.remoteAddress }),
     });
   };
-  const onDisconnect: CentralSystemEvents['disconnect'] = (connection, code, reason) => {
+  const onDisconnect: Events['disconnect'] = (connection, code, reason) => {
     logger({
       time: time(),
       level: 'info',
@@ -77,7 +87,7 @@ export function attachLogger(
       ...(reason ? { reason } : {}),
     });
   };
-  const onRejected: CentralSystemEvents['rejected'] = (info) => {
+  const onRejected: Events['rejected'] = (info) => {
     logger({
       time: time(),
       level: 'warn',
@@ -87,7 +97,7 @@ export function attachLogger(
       reason: info.detail === undefined ? info.reason : `${info.reason}: ${info.detail}`,
     });
   };
-  const onCall: CentralSystemEvents['call'] = (event) => {
+  const onCall: Events['call'] = (event) => {
     const { error } = event;
     logger({
       time: time(),
@@ -108,7 +118,7 @@ export function attachLogger(
         : {}),
     });
   };
-  const onCallCompleted: CentralSystemEvents['callCompleted'] = (event) => {
+  const onCallCompleted: Events['callCompleted'] = (event) => {
     const { error } = event;
     logger({
       time: time(),
@@ -123,7 +133,7 @@ export function attachLogger(
         : {}),
     });
   };
-  const onBadMessage: CentralSystemEvents['badMessage'] = (connection, raw, error) => {
+  const onBadMessage: Events['badMessage'] = (connection, raw, error) => {
     logger({
       time: time(),
       level: 'warn',
@@ -134,7 +144,7 @@ export function attachLogger(
       frame: raw,
     });
   };
-  const onMessage: CentralSystemEvents['message'] = (connection, direction, raw) => {
+  const onMessage: Events['message'] = (connection, direction, raw) => {
     logger({
       time: time(),
       level: 'debug',

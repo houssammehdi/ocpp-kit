@@ -3,6 +3,7 @@ import {
   attachLogger,
   CentralSystem,
   ChargePoint,
+  ChargingStation,
   instrumentCentralSystem,
   jsonLines,
   MetricsRegistry,
@@ -191,5 +192,37 @@ describe('attachLogger', () => {
       reason: 'maintenance',
     });
     expect(entries.some((entry) => entry.event === 'frame')).toBe(false);
+  });
+});
+
+describe('observability of a multi-version Central System', () => {
+  it('labels 2.0.1 actions from the 2.0.1 catalogue and logs the version', async () => {
+    const cs = new CentralSystem({ protocols: ['ocpp2.0.1', 'ocpp1.6'] });
+    cs.v201.handle('Heartbeat', () => ({ currentTime: NOW }));
+    const { port } = await cs.listen(0, '127.0.0.1');
+    cleanups.push(() => cs.close({ timeoutMs: 200 }));
+    const metrics = instrumentCentralSystem(cs);
+    const entries: LogEntry[] = [];
+    const detach = attachLogger(cs, (entry) => entries.push(entry));
+    const station = new ChargingStation({
+      identity: 'CS-OBS',
+      url: `ws://127.0.0.1:${port}`,
+      reconnect: false,
+    });
+    cleanups.push(() => station.close());
+    station.handle('ClearCache', () => ({ status: 'Accepted' }));
+    await station.connect();
+    await station.call('Heartbeat', {});
+    await cs.v201.call('CS-OBS', 'ClearCache', {});
+    const text = metrics.render();
+    expect(text).toContain('ocpp_inbound_calls_total{action="Heartbeat",result="ok"} 1');
+    expect(text).toContain('ocpp_outbound_calls_total{action="ClearCache",result="ok"} 1');
+    expect(text).not.toContain('action="unknown"');
+    expect(entries.find((entry) => entry.event === 'connect')).toMatchObject({
+      identity: 'CS-OBS',
+      version: '2.0.1',
+    });
+    detach();
+    metrics.dispose();
   });
 });

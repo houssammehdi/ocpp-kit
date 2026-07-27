@@ -1,34 +1,53 @@
 import type { IncomingMessage } from 'node:http';
 import type { WebSocket } from 'ws';
 import {
-  CentralSystemToChargePoint,
-  ChargePointToCentralSystem,
+  OCPP16_PROTOCOL,
+  OCPP201_PROTOCOL,
   type BootNotificationRequest,
+  type CentralSystemToChargePoint,
+  type ChargePointToCentralSystem,
+  type ChargingStationToCsms,
+  type CsmsToChargingStation,
+  type v201,
 } from '../messages/index.js';
 import type { HandlerRegistry } from '../rpc/peer.js';
 import { RpcPeer, type CallOptions } from '../rpc/peer.js';
-import type { ActionName, RequestOf, ResponseOf } from '../rpc/validation.js';
+import type { OcppProtocol } from '../rpc/protocol.js';
+import type { ActionName, ActionSchemaMap, RequestOf, ResponseOf } from '../rpc/validation.js';
 import { webSocketDuplex } from '../transport/websocket.js';
 
-/** Context passed to every Central System handler. */
+/** Context passed to every OCPP 1.6 Central System handler. */
 export interface CentralSystemHandlerContext {
   /** The charge point that sent the request. */
   readonly connection: ChargePointConnection;
 }
 
-/** Peer type used for one charge point connection. */
+/** Context passed to every OCPP 2.0.1 CSMS handler (see `CentralSystem.v201`). */
+export interface CsmsHandlerContext {
+  /** The charging station that sent the request. */
+  readonly connection: ChargingStationConnection;
+}
+
+/** Peer type used for one OCPP 1.6 charge point connection. */
 export type CentralSystemPeer = RpcPeer<
   typeof ChargePointToCentralSystem,
   typeof CentralSystemToChargePoint,
   CentralSystemHandlerContext
 >;
 
-/** Options used when creating a {@link ChargePointConnection}. */
-export interface ConnectionOptions {
-  readonly handlers: HandlerRegistry<
-    typeof ChargePointToCentralSystem,
-    CentralSystemHandlerContext
-  >;
+/** Peer type used for one OCPP 2.0.1 charging station connection. */
+export type CsmsPeer = RpcPeer<
+  typeof ChargingStationToCsms,
+  typeof CsmsToChargingStation,
+  CsmsHandlerContext
+>;
+
+/** Options used when creating a connection. */
+export interface ConnectionOptions<
+  In extends ActionSchemaMap = typeof ChargePointToCentralSystem,
+  C extends object = CentralSystemHandlerContext,
+> {
+  readonly handlers: HandlerRegistry<In, C>;
   /** Whether this identity was already registered (accepted boot) earlier. */
   readonly bootAccepted: boolean;
   readonly callTimeoutMs: number;
@@ -36,8 +55,25 @@ export interface ConnectionOptions {
   readonly validateOutbound: boolean;
 }
 
-/** A connected charge point as seen by the Central System. */
-export class ChargePointConnection {
+/**
+ * What every connection of a `CentralSystem` has, whatever OCPP version it speaks: identity,
+ * liveness, the RPC peer and typed calls.
+ *
+ * @typeParam V - the OCPP version, `'1.6'` or `'2.0.1'`
+ * @typeParam In - actions the charge point sends
+ * @typeParam Out - actions the central system sends
+ * @typeParam C - handler context
+ */
+export abstract class OcppConnection<
+  V extends string,
+  In extends ActionSchemaMap,
+  Out extends ActionSchemaMap,
+  C extends object,
+> {
+  /** The OCPP version negotiated for this connection, e.g. `'2.0.1'`. */
+  readonly version: V;
+  /** The negotiated WebSocket subprotocol, e.g. `'ocpp2.0.1'`. */
+  readonly protocol: string;
   /** Charge point identity (last URL path segment). */
   readonly identity: string;
   /** Remote IP address of the charge point. */
@@ -45,9 +81,7 @@ export class ChargePointConnection {
   /** When the WebSocket connection was established. */
   readonly connectedAt: Date;
   /** The underlying RPC peer. Exposed for advanced use such as protocol logging. */
-  readonly peer: CentralSystemPeer;
-  /** The most recent BootNotification received on this connection. */
-  lastBootNotification: BootNotificationRequest | undefined;
+  readonly peer: RpcPeer<In, Out, C>;
   /** Whether the charge point's latest BootNotification was answered with `Accepted`. */
   bootAccepted: boolean;
   /** Timestamp of the last frame received from the charge point. */
@@ -56,23 +90,28 @@ export class ChargePointConnection {
   readonly #ws: WebSocket;
   readonly #closed: Promise<{ code: number; reason: string }>;
 
-  constructor(
+  protected constructor(
+    protocol: OcppProtocol<V, In, Out>,
     ws: WebSocket,
     identity: string,
     request: IncomingMessage,
-    options: ConnectionOptions,
+    options: ConnectionOptions<In, C>,
+    context: C,
   ) {
     this.#ws = ws;
+    this.version = protocol.version;
+    this.protocol = protocol.subprotocol;
     this.identity = identity;
     this.remoteAddress = request.socket.remoteAddress;
     this.connectedAt = new Date();
     this.lastSeen = this.connectedAt;
     this.bootAccepted = options.bootAccepted;
     this.peer = new RpcPeer(webSocketDuplex(ws), {
-      inbound: ChargePointToCentralSystem,
-      outbound: CentralSystemToChargePoint,
+      inbound: protocol.fromChargePoint,
+      outbound: protocol.fromCentralSystem,
       handlers: options.handlers,
-      context: { connection: this },
+      context,
+      errorCodes: protocol.errorCodes,
       callTimeoutMs: options.callTimeoutMs,
       validateInbound: options.validateInbound,
       validateOutbound: options.validateOutbound,
@@ -98,11 +137,11 @@ export class ChargePointConnection {
   }
 
   /** Send a typed CALL to this charge point. */
-  call<A extends ActionName<typeof CentralSystemToChargePoint>>(
+  call<A extends ActionName<Out>>(
     action: A,
-    payload: RequestOf<typeof CentralSystemToChargePoint, A>,
+    payload: RequestOf<Out, A>,
     options?: CallOptions,
-  ): Promise<ResponseOf<typeof CentralSystemToChargePoint, A>> {
+  ): Promise<ResponseOf<Out, A>> {
     return this.peer.call(action, payload, options);
   }
 
@@ -121,3 +160,51 @@ export class ChargePointConnection {
     this.#ws.ping();
   }
 }
+
+/** A connected OCPP 1.6 charge point as seen by the Central System. */
+export class ChargePointConnection extends OcppConnection<
+  '1.6',
+  typeof ChargePointToCentralSystem,
+  typeof CentralSystemToChargePoint,
+  CentralSystemHandlerContext
+> {
+  /** The most recent BootNotification received on this connection. */
+  lastBootNotification: BootNotificationRequest | undefined;
+
+  constructor(
+    ws: WebSocket,
+    identity: string,
+    request: IncomingMessage,
+    options: ConnectionOptions,
+  ) {
+    // Handlers see the connection itself; the context is read at every dispatch.
+    const context: { connection?: ChargePointConnection } = {};
+    super(OCPP16_PROTOCOL, ws, identity, request, options, context as CentralSystemHandlerContext);
+    context.connection = this;
+  }
+}
+
+/** A connected OCPP 2.0.1 charging station as seen by the CSMS. */
+export class ChargingStationConnection extends OcppConnection<
+  '2.0.1',
+  typeof ChargingStationToCsms,
+  typeof CsmsToChargingStation,
+  CsmsHandlerContext
+> {
+  /** The most recent BootNotificationRequest received on this connection. */
+  lastBootNotification: v201.BootNotificationRequest | undefined;
+
+  constructor(
+    ws: WebSocket,
+    identity: string,
+    request: IncomingMessage,
+    options: ConnectionOptions<typeof ChargingStationToCsms, CsmsHandlerContext>,
+  ) {
+    const context: { connection?: ChargingStationConnection } = {};
+    super(OCPP201_PROTOCOL, ws, identity, request, options, context as CsmsHandlerContext);
+    context.connection = this;
+  }
+}
+
+/** A connection of either OCPP version; `version` tells them apart. */
+export type AnyConnection = ChargePointConnection | ChargingStationConnection;

@@ -1,4 +1,9 @@
-import { ChargePointToCentralSystem, CentralSystemToChargePoint } from '../messages/index.js';
+import {
+  ChargePointToCentralSystem,
+  CentralSystemToChargePoint,
+  ChargingStationToCsms,
+  CsmsToChargingStation,
+} from '../messages/index.js';
 import {
   CallAbortedError,
   CallTimeoutError,
@@ -6,6 +11,8 @@ import {
   RpcError,
 } from '../rpc/errors.js';
 import type { CentralSystem, CentralSystemEvents } from '../server/central-system.js';
+import type { AnyConnection } from '../server/connection.js';
+import type { OcppSubprotocol } from '../transport/websocket.js';
 import { DEFAULT_LATENCY_BUCKETS, MetricsRegistry } from './metrics.js';
 
 /** Options of {@link instrumentCentralSystem}. */
@@ -26,6 +33,9 @@ export interface CentralSystemMetrics {
   /** Stop updating the metrics (they keep their values). */
   dispose(): void;
 }
+
+/** Events of a Central System accepting either version. */
+type Events = CentralSystemEvents<AnyConnection>;
 
 /** Action label: names outside the catalogue collapse into one value, bounding cardinality. */
 function actionLabel(action: string, catalogue: object): string {
@@ -55,18 +65,20 @@ function outboundResult(error: Error | undefined): string {
  *   `ok`, `timeout`, `closed`, `aborted`, `invalid_response` or the CALLERROR code;
  * - `ocpp_bad_messages_total{code}` for frames that were not valid OCPP-J.
  *
- * Action names outside the OCPP 1.6 catalogue are counted as `unknown`, so a misbehaving client
- * cannot create unbounded label values.
+ * Action names outside the catalogue of the connection's OCPP version are counted as `unknown`,
+ * so a misbehaving client cannot create unbounded label values.
  *
  * ```ts
  * const metrics = instrumentCentralSystem(cs);
  * http.createServer((req, res) => res.end(metrics.render())).listen(9464);
  * ```
  */
-export function instrumentCentralSystem(
-  cs: CentralSystem,
+export function instrumentCentralSystem<P extends OcppSubprotocol>(
+  server: CentralSystem<P>,
   options: CentralSystemMetricsOptions = {},
 ): CentralSystemMetrics {
+  // Listeners are written for connections of either version.
+  const cs = server as unknown as CentralSystem<OcppSubprotocol>;
   const registry = options.registry ?? new MetricsRegistry();
   const prefix = options.prefix ?? 'ocpp_';
   const buckets = options.buckets ?? DEFAULT_LATENCY_BUCKETS;
@@ -124,20 +136,26 @@ export function instrumentCentralSystem(
     disconnections.inc();
     connected.set(cs.connections.size);
   };
-  const onRejected: CentralSystemEvents['rejected'] = ({ reason }) => {
+  const onRejected: Events['rejected'] = ({ reason }) => {
     rejected.inc({ reason });
   };
-  const onCall: CentralSystemEvents['call'] = (event) => {
-    const action = actionLabel(event.action, ChargePointToCentralSystem);
+  const onCall: Events['call'] = (event) => {
+    const action = actionLabel(
+      event.action,
+      event.connection.version === '2.0.1' ? ChargingStationToCsms : ChargePointToCentralSystem,
+    );
     inboundCalls.inc({ action, result: event.error ? event.error.code : 'ok' });
     inboundDuration.observe({ action }, event.durationMs / 1_000);
   };
-  const onCallCompleted: CentralSystemEvents['callCompleted'] = (event) => {
-    const action = actionLabel(event.action, CentralSystemToChargePoint);
+  const onCallCompleted: Events['callCompleted'] = (event) => {
+    const action = actionLabel(
+      event.action,
+      event.connection.version === '2.0.1' ? CsmsToChargingStation : CentralSystemToChargePoint,
+    );
     outboundCalls.inc({ action, result: outboundResult(event.error) });
     outboundDuration.observe({ action }, event.durationMs / 1_000);
   };
-  const onBadMessage: CentralSystemEvents['badMessage'] = (_connection, _raw, error) => {
+  const onBadMessage: Events['badMessage'] = (_connection, _raw, error) => {
     badMessages.inc({ code: error.code });
   };
   cs.on('connect', onConnect);
