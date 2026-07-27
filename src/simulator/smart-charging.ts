@@ -23,25 +23,57 @@ export interface TransactionContext {
   readonly startedAt: Date;
 }
 
-interface Installed {
-  readonly connectorId: number;
-  readonly profile: ChargingProfile;
+// ---------------------------------------------------------------------------------------------
+// The version-neutral engine
+// ---------------------------------------------------------------------------------------------
+
+/** One step of a schedule: a limit from `startPeriod` seconds after the schedule start. */
+export interface SchedulePeriod {
+  readonly startPeriod: number;
+  readonly limit: number;
+  readonly numberPhases?: number | undefined;
+}
+
+/** A charging schedule as the engine evaluates it (the same shape in OCPP 1.6 and 2.0.1). */
+export interface ScheduleShape {
+  readonly startSchedule?: string | undefined;
+  readonly duration?: number | undefined;
+  readonly chargingRateUnit: ChargingRateUnit;
+  readonly chargingSchedulePeriod: readonly SchedulePeriod[];
+}
+
+/**
+ * A charging profile in the version-neutral form the engine evaluates. OCPP 1.6 and 2.0.1 anchor
+ * schedules in time the same way (Absolute, Relative, Daily/Weekly Recurring) and choose between
+ * profiles of one purpose the same way (highest valid stack level); what differs between the
+ * versions is which profiles a charge point accepts and how purposes combine, which the
+ * version-specific managers decide.
+ */
+export interface StackedProfile {
+  readonly id: number;
+  readonly stackLevel: number;
+  readonly kind: 'Absolute' | 'Recurring' | 'Relative';
+  readonly recurrencyKind?: 'Daily' | 'Weekly' | undefined;
+  readonly validFrom?: string | undefined;
+  readonly validTo?: string | undefined;
+  readonly schedule: ScheduleShape;
   /**
    * When the profile was installed: the schedule start of an Absolute profile without
-   * startSchedule that is evaluated outside a transaction (e.g. a ChargePointMaxProfile).
+   * startSchedule that is evaluated outside a transaction (e.g. a station-wide maximum).
    */
   readonly receivedAt: Date;
 }
 
-const DAY_MS = 86_400_000;
-
 /** A limit evaluated at an instant, always expressed in watts. */
-interface Limit {
+export interface PowerLimit {
   readonly watts: number;
   readonly numberPhases: number | undefined;
 }
 
-function toWatts(
+const DAY_MS = 86_400_000;
+
+/** Convert a schedule limit to watts. */
+export function toWatts(
   limit: number,
   unit: ChargingRateUnit,
   phases: number,
@@ -50,7 +82,8 @@ function toWatts(
   return unit === 'W' ? limit : limit * spec.voltage * phases;
 }
 
-function fromWatts(
+/** Convert watts to a schedule limit in `unit`. */
+export function fromWatts(
   watts: number,
   unit: ChargingRateUnit,
   phases: number,
@@ -59,23 +92,26 @@ function fromWatts(
   return unit === 'W' ? watts : watts / (spec.voltage * phases);
 }
 
-/** Start instant of the schedule instance that is (or was last) active at `at`. */
-function scheduleStart(
-  entry: Installed,
+/**
+ * Start instant of the schedule instance that is (or was last) active at `at`.
+ *
+ * @param startedAt - start of the transaction the profile is evaluated for, if any
+ */
+export function scheduleStart(
+  profile: StackedProfile,
   at: Date,
-  tx: TransactionContext | undefined,
+  startedAt: Date | undefined,
 ): Date | undefined {
-  const { profile } = entry;
-  const { startSchedule } = profile.chargingSchedule;
-  switch (profile.chargingProfileKind) {
+  const { startSchedule } = profile.schedule;
+  switch (profile.kind) {
     case 'Absolute':
       // OCPP 1.6 ChargingSchedule.startSchedule: "If absent the schedule will be relative to
       // start of charging." Without a transaction there is no such start, so fall back to the
       // moment the profile was installed.
       if (startSchedule) return new Date(startSchedule);
-      return tx?.startedAt ?? entry.receivedAt;
+      return startedAt ?? profile.receivedAt;
     case 'Relative':
-      return tx?.startedAt ?? at;
+      return startedAt ?? at;
     case 'Recurring': {
       if (!startSchedule) return undefined;
       const period = profile.recurrencyKind === 'Weekly' ? 7 * DAY_MS : DAY_MS;
@@ -86,28 +122,27 @@ function scheduleStart(
   }
 }
 
-function isValidAt(profile: ChargingProfile, at: Date): boolean {
+function isValidAt(profile: StackedProfile, at: Date): boolean {
   if (profile.validFrom && at < new Date(profile.validFrom)) return false;
   if (profile.validTo && at >= new Date(profile.validTo)) return false;
   return true;
 }
 
 /** Evaluate one profile at `at`; `undefined` when it does not constrain that instant. */
-function evaluate(
-  entry: Installed,
+export function evaluateProfile(
+  profile: StackedProfile,
   at: Date,
-  tx: TransactionContext | undefined,
+  startedAt: Date | undefined,
   spec: ElectricalSpec,
-): Limit | undefined {
-  const { profile } = entry;
+): PowerLimit | undefined {
   if (!isValidAt(profile, at)) return undefined;
-  const start = scheduleStart(entry, at, tx);
+  const start = scheduleStart(profile, at, startedAt);
   if (!start) return undefined;
   const elapsedS = (at.getTime() - start.getTime()) / 1_000;
-  const schedule = profile.chargingSchedule;
+  const { schedule } = profile;
   if (elapsedS < 0) return undefined;
   if (schedule.duration !== undefined && elapsedS >= schedule.duration) return undefined;
-  let active: ChargingSchedulePeriod | undefined;
+  let active: SchedulePeriod | undefined;
   for (const period of schedule.chargingSchedulePeriod) {
     if (period.startPeriod <= elapsedS && (!active || period.startPeriod >= active.startPeriod)) {
       active = period;
@@ -121,10 +156,128 @@ function evaluate(
   };
 }
 
-function minLimit(a: Limit | undefined, b: Limit | undefined): Limit | undefined {
+/**
+ * The limit of the valid profile with the highest stack level among `candidates` (the profiles
+ * of one purpose), or `undefined` when none constrains `at`.
+ */
+export function stackLimit(
+  candidates: readonly StackedProfile[],
+  at: Date,
+  startedAt: Date | undefined,
+  spec: ElectricalSpec,
+): PowerLimit | undefined {
+  const sorted = [...candidates].sort((a, b) => b.stackLevel - a.stackLevel);
+  for (const profile of sorted) {
+    const limit = evaluateProfile(profile, at, startedAt, spec);
+    if (limit) return limit;
+  }
+  return undefined;
+}
+
+/** The lower of two limits (either may be absent). */
+export function minLimit(
+  a: PowerLimit | undefined,
+  b: PowerLimit | undefined,
+): PowerLimit | undefined {
   if (!a) return b;
   if (!b) return a;
   return a.watts <= b.watts ? a : b;
+}
+
+/** Instants within `[from, to)` where any of `profiles` may change its limit, sorted. */
+export function profileBreakpoints(
+  profiles: readonly StackedProfile[],
+  from: Date,
+  to: Date,
+  startedAt: Date | undefined,
+): number[] {
+  const points = new Set<number>([from.getTime()]);
+  const add = (time: number): void => {
+    if (time > from.getTime() && time < to.getTime()) points.add(time);
+  };
+  for (const profile of profiles) {
+    if (profile.validFrom) add(new Date(profile.validFrom).getTime());
+    if (profile.validTo) add(new Date(profile.validTo).getTime());
+    const cycle =
+      profile.kind === 'Recurring'
+        ? profile.recurrencyKind === 'Weekly'
+          ? 7 * DAY_MS
+          : DAY_MS
+        : undefined;
+    const first = scheduleStart(profile, from, startedAt);
+    if (!first) continue;
+    const starts = [first.getTime()];
+    if (cycle) for (let t = first.getTime() + cycle; t < to.getTime(); t += cycle) starts.push(t);
+    for (const start of starts) {
+      for (const period of profile.schedule.chargingSchedulePeriod) {
+        add(start + period.startPeriod * 1_000);
+      }
+      if (profile.schedule.duration !== undefined) add(start + profile.schedule.duration * 1_000);
+    }
+  }
+  return [...points].sort((a, b) => a - b);
+}
+
+/**
+ * The periods of a composite schedule from `now`: the effective limit (`limitAt`, capped by the
+ * hardware maximum) at every breakpoint, in `unit`, with consecutive equal limits merged.
+ */
+export function compositePeriods(
+  breakpoints: readonly number[],
+  now: Date,
+  limitAt: (at: Date) => PowerLimit | undefined,
+  options: {
+    readonly unit: ChargingRateUnit;
+    readonly hardwareMaxW: number;
+    readonly spec: ElectricalSpec;
+  },
+): ChargingSchedulePeriod[] {
+  const { unit, hardwareMaxW, spec } = options;
+  const periods: ChargingSchedulePeriod[] = [];
+  for (const time of breakpoints) {
+    const limit = minLimit(limitAt(new Date(time)), {
+      watts: hardwareMaxW,
+      numberPhases: undefined,
+    });
+    const phases = limit?.numberPhases ?? spec.phases;
+    const value = Math.round(fromWatts(limit?.watts ?? hardwareMaxW, unit, phases, spec) * 10) / 10;
+    const startPeriod = Math.round((time - now.getTime()) / 1_000);
+    // Breakpoints less than a second apart round to the same startPeriod; startPeriods must
+    // increase, so the later limit (the one that holds from then on) takes the slot.
+    if (periods.at(-1)?.startPeriod === startPeriod) periods.pop();
+    const previous = periods.at(-1);
+    if (previous?.limit === value && previous.numberPhases === limit?.numberPhases) continue;
+    periods.push({
+      startPeriod,
+      limit: value,
+      ...(limit?.numberPhases === undefined ? {} : { numberPhases: limit.numberPhases }),
+    });
+  }
+  return periods;
+}
+
+// ---------------------------------------------------------------------------------------------
+// OCPP 1.6
+// ---------------------------------------------------------------------------------------------
+
+interface Installed {
+  readonly connectorId: number;
+  readonly profile: ChargingProfile;
+  readonly stacked: StackedProfile;
+}
+
+/** The engine's view of an OCPP 1.6 profile. */
+function stacked(profile: ChargingProfile, receivedAt: Date): StackedProfile {
+  return {
+    id: profile.chargingProfileId,
+    stackLevel: profile.stackLevel,
+    kind: profile.chargingProfileKind,
+    recurrencyKind: profile.recurrencyKind,
+    validFrom: profile.validFrom,
+    validTo: profile.validTo,
+    schedule: profile.chargingSchedule,
+    receivedAt,
+  };
 }
 
 /** Options of {@link ChargingProfileManager}. */
@@ -140,12 +293,14 @@ export interface ChargingProfileManagerOptions {
 }
 
 /**
- * Stores charging profiles and evaluates them following the OCPP 1.6 stacking rules:
+ * Stores OCPP 1.6 charging profiles and evaluates them following the 1.6 stacking rules:
  *
  * - Within a purpose, the valid profile with the highest `stackLevel` wins.
  * - A `TxProfile` overrides `TxDefaultProfile`s; a connector-specific `TxDefaultProfile`
  *   overrides one installed on connector 0.
  * - `ChargePointMaxProfile` (connector 0 only) caps the charge point as a whole.
+ * - A new profile replaces one with the same id, or with the same purpose and stack level on the
+ *   same connector.
  */
 export class ChargingProfileManager {
   readonly #options: Required<ChargingProfileManagerOptions>;
@@ -212,7 +367,10 @@ export class ChargingProfileManager {
       purpose === 'TxProfile' && activeTransaction
         ? { ...profile, transactionId: activeTransaction.transactionId }
         : profile;
-    this.#installed = [...remaining, { connectorId, profile: stored, receivedAt: now }];
+    this.#installed = [
+      ...remaining,
+      { connectorId, profile: stored, stacked: stacked(stored, now) },
+    ];
     return 'Accepted';
   }
 
@@ -254,15 +412,11 @@ export class ChargingProfileManager {
     at: Date,
     tx: TransactionContext | undefined,
     spec: ElectricalSpec,
-  ): Limit | undefined {
+  ): PowerLimit | undefined {
     const candidates = this.#installed
       .filter((e) => e.connectorId === connectorId && e.profile.chargingProfilePurpose === purpose)
-      .sort((a, b) => b.profile.stackLevel - a.profile.stackLevel);
-    for (const entry of candidates) {
-      const limit = evaluate(entry, at, tx, spec);
-      if (limit) return limit;
-    }
-    return undefined;
+      .map((e) => e.stacked);
+    return stackLimit(candidates, at, tx?.startedAt, spec);
   }
 
   #transactionLimit(
@@ -270,7 +424,7 @@ export class ChargingProfileManager {
     at: Date,
     tx: TransactionContext | undefined,
     spec: ElectricalSpec,
-  ): Limit | undefined {
+  ): PowerLimit | undefined {
     if (connectorId > 0 && tx) {
       const txLimit = this.#winner(connectorId, 'TxProfile', at, tx, spec);
       if (txLimit) return txLimit;
@@ -297,38 +451,6 @@ export class ChargingProfileManager {
     return this.#transactionLimit(connectorId, at, tx, spec)?.watts;
   }
 
-  /** Breakpoints where any profile may change its limit within `[from, to)`. */
-  #breakpoints(from: Date, to: Date, tx: TransactionContext | undefined): number[] {
-    const points = new Set<number>([from.getTime()]);
-    const add = (time: number): void => {
-      if (time > from.getTime() && time < to.getTime()) points.add(time);
-    };
-    for (const entry of this.#installed) {
-      const { profile } = entry;
-      if (profile.validFrom) add(new Date(profile.validFrom).getTime());
-      if (profile.validTo) add(new Date(profile.validTo).getTime());
-      const cycle =
-        profile.chargingProfileKind === 'Recurring'
-          ? profile.recurrencyKind === 'Weekly'
-            ? 7 * DAY_MS
-            : DAY_MS
-          : undefined;
-      const first = scheduleStart(entry, from, tx);
-      if (!first) continue;
-      const starts = [first.getTime()];
-      if (cycle) for (let t = first.getTime() + cycle; t < to.getTime(); t += cycle) starts.push(t);
-      for (const start of starts) {
-        for (const period of profile.chargingSchedule.chargingSchedulePeriod) {
-          add(start + period.startPeriod * 1_000);
-        }
-        if (profile.chargingSchedule.duration !== undefined) {
-          add(start + profile.chargingSchedule.duration * 1_000);
-        }
-      }
-    }
-    return [...points].sort((a, b) => a - b);
-  }
-
   /**
    * Handle GetCompositeSchedule: the effective limit over the next `durationS` seconds,
    * combining all applicable profiles and the hardware maximum.
@@ -349,33 +471,22 @@ export class ChargingProfileManager {
     const unit = options.unit ?? 'W';
     const end = new Date(now.getTime() + durationS * 1_000);
     const tx = options.transaction;
-    const periods: ChargingSchedulePeriod[] = [];
-    for (const time of this.#breakpoints(now, end, tx)) {
-      const at = new Date(time);
-      const limit = minLimit(
+    const breakpoints = profileBreakpoints(
+      this.#installed.map((entry) => entry.stacked),
+      now,
+      end,
+      tx?.startedAt,
+    );
+    const periods = compositePeriods(
+      breakpoints,
+      now,
+      (at) =>
         minLimit(
           this.#winner(0, 'ChargePointMaxProfile', at, undefined, options.spec),
           this.#transactionLimit(connectorId, at, tx, options.spec),
         ),
-        { watts: options.hardwareMaxW, numberPhases: undefined },
-      );
-      const phases = limit?.numberPhases ?? options.spec.phases;
-      const value =
-        Math.round(
-          fromWatts(limit?.watts ?? options.hardwareMaxW, unit, phases, options.spec) * 10,
-        ) / 10;
-      const startPeriod = Math.round((time - now.getTime()) / 1_000);
-      // Breakpoints less than a second apart round to the same startPeriod; startPeriods must
-      // increase, so the later limit (the one that holds from then on) takes the slot.
-      if (periods.at(-1)?.startPeriod === startPeriod) periods.pop();
-      const previous = periods.at(-1);
-      if (previous?.limit === value && previous.numberPhases === limit?.numberPhases) continue;
-      periods.push({
-        startPeriod,
-        limit: value,
-        ...(limit?.numberPhases === undefined ? {} : { numberPhases: limit.numberPhases }),
-      });
-    }
+      { unit, hardwareMaxW: options.hardwareMaxW, spec: options.spec },
+    );
     return {
       status: 'Accepted',
       connectorId,
