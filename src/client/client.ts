@@ -415,9 +415,12 @@ export abstract class OcppClient<
       if (error) throw error;
     }
     if (this.#stopped) throw new ConnectionClosedError(1000, 'Client closed');
-    // Load persisted messages first: saving before that would overwrite them.
-    await queue.init();
-    if (this.#isStopped()) throw new ConnectionClosedError(1000, 'Client closed');
+    if (!queue.isLoaded) {
+      // Load persisted messages first: saving before that would overwrite them.
+      await queue.init();
+      if (this.#isStopped()) throw new ConnectionClosedError(1000, 'Client closed');
+    }
+    // From here on synchronous: a message queued right before close() is kept in the store.
     const { message, evicted, persisted } = queue.enqueue(
       action,
       payload,

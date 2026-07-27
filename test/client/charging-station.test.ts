@@ -203,4 +203,24 @@ describe('ChargingStation', () => {
     });
     expect(second.station.queueSize).toBe(0);
   });
+
+  it('keeps a TransactionEvent queued right before close() (regression)', async () => {
+    const store = new MemoryQueueStore();
+    const first = setup({ offlineQueue: { store } });
+    await first.station.connect();
+    await boot(first.station);
+    // Not awaited: an Ended event generated as the station shuts down.
+    const pending = first.station.call('TransactionEvent', event(5, 'Ended', 'ResetCommand'));
+    pending.catch(() => undefined);
+    await first.station.close();
+    expect(await store.load()).toHaveLength(1);
+    const second = setup({ offlineQueue: { store } });
+    await second.station.connect();
+    await boot(second.station);
+    await vi.waitFor(() => {
+      expect(second.csms.requestsOf('TransactionEvent').map((request) => request.seqNo)).toEqual([
+        5,
+      ]);
+    });
+  });
 });
