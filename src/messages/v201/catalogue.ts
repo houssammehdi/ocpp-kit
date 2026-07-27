@@ -260,13 +260,17 @@ export const UNSUPPORTED_ACTIONS_201 = [
 ] as const;
 
 /** OCPP 2.0.1 as a protocol definition for the version-generic layers. */
-export const OCPP201_PROTOCOL: OcppProtocol<'2.0.1', ChargingStationToCsms, CsmsToChargingStation> =
-  {
-    version: '2.0.1',
-    name: 'OCPP 2.0.1',
-    subprotocol: 'ocpp2.0.1',
-    errorCodes: OCPP201_ERROR_CODES,
-    fromChargePoint: ChargingStationToCsms,
-    fromCentralSystem: CsmsToChargingStation,
-    transactionActions: ['TransactionEvent'],
-  };
+export const OCPP201_PROTOCOL: OcppProtocol<
+  '2.0.1',
+  ChargingStationToCsms,
+  CsmsToChargingStation,
+  'TransactionEvent'
+> = {
+  version: '2.0.1',
+  name: 'OCPP 2.0.1',
+  subprotocol: 'ocpp2.0.1',
+  errorCodes: OCPP201_ERROR_CODES,
+  fromChargePoint: ChargingStationToCsms,
+  fromCentralSystem: CsmsToChargingStation,
+  transactionActions: ['TransactionEvent'],
+};

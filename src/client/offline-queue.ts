@@ -4,11 +4,15 @@ import type { TransactionAction } from '../messages/index.js';
 import type { JsonObject } from '../rpc/frames.js';
 import { OcppKitError } from '../rpc/errors.js';
 
-/** A transaction-related message waiting for delivery. */
-export interface QueuedMessage {
+/**
+ * A transaction-related message waiting for delivery.
+ *
+ * @typeParam A - the queued action names; OCPP 1.6 by default, `'TransactionEvent'` for 2.0.1
+ */
+export interface QueuedMessage<A extends string = TransactionAction> {
   /** Monotonic sequence number; delivery happens in ascending order. */
   readonly seq: number;
-  readonly action: TransactionAction;
+  readonly action: A;
   readonly payload: JsonObject;
   /** ISO timestamp of when the message was queued. */
   readonly enqueuedAt: string;
@@ -21,23 +25,26 @@ export interface QueuedMessage {
   readonly transactionRef?: string;
 }
 
-/** Persistence backend of an {@link OfflineQueue}. */
+/**
+ * Persistence backend of an {@link OfflineQueue}. Stores are version-agnostic: they keep
+ * whatever messages they are given.
+ */
 export interface OfflineQueueStore {
   /** Load all persisted messages (any order; the queue sorts by `seq`). */
-  load(): Promise<QueuedMessage[]>;
+  load(): Promise<QueuedMessage<string>[]>;
   /** Replace the persisted contents with `messages`. */
-  save(messages: readonly QueuedMessage[]): Promise<void>;
+  save(messages: readonly QueuedMessage<string>[]): Promise<void>;
 }
 
 /** Keeps messages in memory only: they survive disconnects but not process restarts. */
 export class MemoryQueueStore implements OfflineQueueStore {
-  #messages: QueuedMessage[] = [];
+  #messages: QueuedMessage<string>[] = [];
 
-  load(): Promise<QueuedMessage[]> {
+  load(): Promise<QueuedMessage<string>[]> {
     return Promise.resolve([...this.#messages]);
   }
 
-  save(messages: readonly QueuedMessage[]): Promise<void> {
+  save(messages: readonly QueuedMessage<string>[]): Promise<void> {
     this.#messages = [...messages];
     return Promise.resolve();
   }
@@ -55,7 +62,7 @@ export class FileQueueStore implements OfflineQueueStore {
     this.#path = path;
   }
 
-  async load(): Promise<QueuedMessage[]> {
+  async load(): Promise<QueuedMessage<string>[]> {
     let text: string;
     try {
       text = await readFile(this.#path, 'utf8');
@@ -65,10 +72,10 @@ export class FileQueueStore implements OfflineQueueStore {
     }
     const parsed: unknown = JSON.parse(text);
     if (!Array.isArray(parsed)) throw new OcppKitError(`Corrupt offline queue file ${this.#path}`);
-    return parsed as QueuedMessage[];
+    return parsed as QueuedMessage<string>[];
   }
 
-  save(messages: readonly QueuedMessage[]): Promise<void> {
+  save(messages: readonly QueuedMessage<string>[]): Promise<void> {
     const snapshot = JSON.stringify(messages);
     const write = async (): Promise<void> => {
       await mkdir(dirname(this.#path), { recursive: true });
@@ -82,11 +89,11 @@ export class FileQueueStore implements OfflineQueueStore {
 }
 
 /** Result of {@link OfflineQueue.enqueue}. */
-export interface QueueInsertion {
+export interface QueueInsertion<A extends string = TransactionAction> {
   /** The queued message. */
-  readonly message: QueuedMessage;
-  /** A MeterValues message discarded to make room, if any. */
-  readonly evicted?: QueuedMessage;
+  readonly message: QueuedMessage<A>;
+  /** A message discarded to make room, if any. */
+  readonly evicted?: QueuedMessage<A>;
   /** Settles once the store has saved the queue including the new message. */
   readonly persisted: Promise<void>;
 }
@@ -98,25 +105,43 @@ export class OfflineQueueFullError extends OcppKitError {
   }
 }
 
+/** Which queued messages may be discarded when the queue is full. */
+export type EvictionPolicy<A extends string = TransactionAction> = (
+  message: QueuedMessage<A>,
+) => boolean;
+
+/** The default {@link EvictionPolicy}: only OCPP 1.6 MeterValues. */
+export const evictMeterValues: EvictionPolicy<string> = (message) =>
+  message.action === 'MeterValues';
+
 /**
  * Ordered, persistent FIFO of transaction-related messages.
  *
- * When full, the oldest `MeterValues` entry that is not being sent right now is discarded to make
- * room, because periodic samples are the least valuable data; Start/StopTransaction are never
- * discarded (the push fails instead).
+ * When full, the oldest message the eviction policy allows (by default a 1.6 `MeterValues`) that
+ * is not being sent right now is discarded to make room, because periodic samples are the least
+ * valuable data; messages that start or end a transaction are never discarded (the push fails
+ * instead).
+ *
+ * @typeParam A - the queued action names
  */
-export class OfflineQueue {
+export class OfflineQueue<A extends string = TransactionAction> {
   readonly #store: OfflineQueueStore;
   readonly #maxSize: number;
-  #messages: QueuedMessage[] = [];
+  readonly #evictable: EvictionPolicy<A>;
+  #messages: QueuedMessage<A>[] = [];
   #nextSeq = 1;
   #loading: Promise<void> | undefined;
   #loaded = false;
   #inFlight: number | undefined;
 
-  constructor(store: OfflineQueueStore = new MemoryQueueStore(), maxSize = 10_000) {
+  constructor(
+    store: OfflineQueueStore = new MemoryQueueStore(),
+    maxSize = 10_000,
+    evictable: EvictionPolicy<A> = evictMeterValues,
+  ) {
     this.#store = store;
     this.#maxSize = maxSize;
+    this.#evictable = evictable;
   }
 
   /** Number of queued messages. */
@@ -134,7 +159,7 @@ export class OfflineQueue {
   }
 
   async #load(): Promise<void> {
-    const loaded = await this.#store.load();
+    const loaded = (await this.#store.load()) as QueuedMessage<A>[];
     this.#messages = [...loaded].sort((a, b) => a.seq - b.seq);
     // A loop rather than Math.max(...seqs): spreading a few hundred thousand arguments throws
     // a RangeError, which would make a large persisted queue impossible to restore.
@@ -145,12 +170,12 @@ export class OfflineQueue {
   }
 
   /** The next message to deliver, if any. */
-  peek(): QueuedMessage | undefined {
+  peek(): QueuedMessage<A> | undefined {
     return this.#messages[0];
   }
 
   /** Snapshot of all queued messages in delivery order. */
-  list(): readonly QueuedMessage[] {
+  list(): readonly QueuedMessage<A>[] {
     return [...this.#messages];
   }
 
@@ -180,20 +205,18 @@ export class OfflineQueue {
    * @throws {@link OfflineQueueFullError} when full and no MeterValues can be evicted
    */
   enqueue(
-    action: QueuedMessage['action'],
+    action: A,
     payload: JsonObject,
     options: { readonly transactionRef?: string } = {},
-  ): QueueInsertion {
+  ): QueueInsertion<A> {
     if (!this.#loaded) throw new OcppKitError('OfflineQueue.init() must complete before enqueue()');
-    let evicted: QueuedMessage | undefined;
+    let evicted: QueuedMessage<A> | undefined;
     if (this.#messages.length >= this.#maxSize) {
-      const index = this.#messages.findIndex(
-        (m) => m.action === 'MeterValues' && m.seq !== this.#inFlight,
-      );
+      const index = this.#messages.findIndex((m) => this.#evictable(m) && m.seq !== this.#inFlight);
       if (index < 0) throw new OfflineQueueFullError(this.#maxSize);
       [evicted] = this.#messages.splice(index, 1);
     }
-    const message: QueuedMessage = {
+    const message: QueuedMessage<A> = {
       seq: this.#nextSeq++,
       action,
       payload,
@@ -207,10 +230,10 @@ export class OfflineQueue {
 
   /** Append a message and persist the queue. Returns the discarded message, if any. */
   async push(
-    action: QueuedMessage['action'],
+    action: A,
     payload: JsonObject,
     options: { readonly transactionRef?: string } = {},
-  ): Promise<{ message: QueuedMessage; evicted?: QueuedMessage }> {
+  ): Promise<{ message: QueuedMessage<A>; evicted?: QueuedMessage<A> }> {
     await this.init();
     const { persisted, ...inserted } = this.enqueue(action, payload, options);
     await persisted;
@@ -245,7 +268,7 @@ export class OfflineQueue {
    *
    * @returns the removed messages
    */
-  async removeDependents(transactionRef: string): Promise<QueuedMessage[]> {
+  async removeDependents(transactionRef: string): Promise<QueuedMessage<A>[]> {
     const removed = this.#messages.filter(
       (m) => m.transactionRef === transactionRef && m.action !== 'StartTransaction',
     );

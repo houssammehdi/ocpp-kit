@@ -7,7 +7,7 @@ import {
 import { WebSocket, type ClientOptions } from 'ws';
 import type { Duplex } from '../rpc/duplex.js';
 import { OcppKitError } from '../rpc/errors.js';
-import { OCPP16_SUBPROTOCOL, webSocketDuplex } from '../transport/websocket.js';
+import { webSocketDuplex } from '../transport/websocket.js';
 import { timerDelay } from '../util/timers.js';
 import type { PemInput } from '../util/pem.js';
 
@@ -160,9 +160,11 @@ export const webSocketConnector: Connector = (request) =>
       fail(new HandshakeError(`Connection closed during handshake (${code})`));
     });
     ws.once('open', () => {
-      if (ws.protocol !== OCPP16_SUBPROTOCOL) {
+      if (!request.protocols.includes(ws.protocol)) {
         ws.terminate();
-        fail(new HandshakeError(`Server did not accept subprotocol ${OCPP16_SUBPROTOCOL}`));
+        fail(
+          new HandshakeError(`Server did not accept subprotocol ${request.protocols.join(' or ')}`),
+        );
         return;
       }
       settled = true;

@@ -1,8 +1,14 @@
-import { CentralSystemToChargePoint, ChargePointToCentralSystem } from '../src/messages/index.js';
+import {
+  CentralSystemToChargePoint,
+  ChargePointToCentralSystem,
+  ChargingStationToCsms,
+  CsmsToChargingStation,
+} from '../src/messages/index.js';
 import type { ConnectRequest, Connector } from '../src/client/index.js';
 import {
   createDuplexPair,
   HandlerRegistry,
+  OCPP201_ERROR_CODES,
   RpcPeer,
   type Duplex,
   type JsonObject,
@@ -161,6 +167,57 @@ export class FakeCentralSystem {
   }
 
   get current(): CsPeer | undefined {
+    return this.peers.at(-1);
+  }
+
+  drop(): Promise<void> {
+    return this.current?.close(1006, 'network down') ?? Promise.resolve();
+  }
+}
+
+/** A peer of the in-memory OCPP 2.0.1 CSMS. */
+export type CsmsPeer201 = RpcPeer<typeof ChargingStationToCsms, typeof CsmsToChargingStation>;
+
+/** An in-memory OCPP 2.0.1 CSMS that clients reach through an injected {@link Connector}. */
+export class FakeCsms {
+  readonly handlers = new HandlerRegistry<typeof ChargingStationToCsms>();
+  readonly peers: CsmsPeer201[] = [];
+  readonly requests: ConnectRequest[] = [];
+  readonly calls: RecordedCall[] = [];
+  available = true;
+
+  readonly connector: Connector = (request) => {
+    this.requests.push(request);
+    if (!this.available) return Promise.reject(new Error('connection refused'));
+    const [clientSide, serverSide] = createDuplexPair();
+    const peer: CsmsPeer201 = new RpcPeer(serverSide, {
+      inbound: ChargingStationToCsms,
+      outbound: CsmsToChargingStation,
+      handlers: this.handlers,
+      errorCodes: OCPP201_ERROR_CODES,
+    });
+    peer.on('callHandled', (event) => {
+      this.calls.push({
+        action: event.action,
+        request: event.request,
+        ...(event.response ? { response: event.response } : {}),
+      });
+    });
+    this.peers.push(peer);
+    return Promise.resolve(clientSide);
+  };
+
+  /** Action names received so far, in order. */
+  get received(): string[] {
+    return this.calls.map((call) => call.action);
+  }
+
+  /** Requests received for one action. */
+  requestsOf(action: string): JsonObject[] {
+    return this.calls.filter((call) => call.action === action).map((call) => call.request);
+  }
+
+  get current(): CsmsPeer201 | undefined {
     return this.peers.at(-1);
   }
 

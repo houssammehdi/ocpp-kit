@@ -206,7 +206,8 @@ export function isTransactionAction(action: string): action is TransactionAction
 export const OCPP16_PROTOCOL: OcppProtocol<
   '1.6',
   ChargePointToCentralSystem,
-  CentralSystemToChargePoint
+  CentralSystemToChargePoint,
+  TransactionAction
 > = {
   version: '1.6',
   name: 'OCPP 1.6-J',

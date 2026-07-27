@@ -11,11 +11,13 @@ import type { ActionSchemaMap } from './validation.js';
  * @typeParam V - version, e.g. `'1.6'`
  * @typeParam Up - actions the charge point sends
  * @typeParam Down - actions the central system sends
+ * @typeParam T - the transaction-related actions
  */
 export interface OcppProtocol<
   V extends string = string,
   Up extends ActionSchemaMap = ActionSchemaMap,
   Down extends ActionSchemaMap = ActionSchemaMap,
+  T extends keyof Up & string = keyof Up & string,
 > {
   /** Version number, e.g. `'1.6'` or `'2.0.1'`. */
   readonly version: V;
@@ -33,5 +35,5 @@ export interface OcppProtocol<
    * Charge point actions that must reach the central system reliably and in order, even across
    * connection loss (the "transaction-related messages").
    */
-  readonly transactionActions: readonly (keyof Up & string)[];
+  readonly transactionActions: readonly T[];
 }
