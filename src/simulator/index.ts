@@ -10,3 +10,4 @@ export * from './smart-charging.js';
 export * from './stats.js';
 export * from './charger.js';
 export * from './fleet.js';
+export * from './v201/index.js';
