@@ -562,3 +562,16 @@ describe('ChargePoint.startTransaction', () => {
     expect(csms.requestsOf('StopTransaction')[0]).toMatchObject({ transactionId: 100 });
   });
 });
+
+describe('ChargePoint shutdown', () => {
+  it('keeps a StopTransaction queued right before close() (regression)', async () => {
+    const store = new MemoryQueueStore();
+    const { cp } = setup({ offlineQueue: { store } });
+    await cp.connect();
+    await until(() => cp.registrationStatus === 'Accepted');
+    const stop = cp.call('StopTransaction', { transactionId: 7, meterStop: 10, timestamp: NOW });
+    stop.catch(() => undefined);
+    await cp.close();
+    expect((await store.load()).map((message) => message.action)).toEqual(['StopTransaction']);
+  });
+});
