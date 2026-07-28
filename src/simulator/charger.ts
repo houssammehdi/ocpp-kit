@@ -72,6 +72,7 @@ import {
 } from './reservations.js';
 import {
   ChargingProfileManager,
+  maxMinFairShare,
   type ElectricalSpec,
   type TransactionContext,
 } from './smart-charging.js';
@@ -1423,19 +1424,14 @@ export class SimulatedCharger extends TypedEventEmitter<SimulatedChargerEvents> 
     const result = new Map<Connector, number>(caps.map(({ c, cap }) => [c, cap]));
     const station = this.profiles.stationLimitW(now, this.#spec);
     if (station === undefined) return result;
-    const demand = (c: Connector, cap: number): number =>
-      Math.min(cap, c.ev ? acceptedPowerW(c.ev.profile, c.ev.soc) : 0);
-    const byDemand = caps
-      .map(({ c, cap }) => ({ c, cap, demand: demand(c, cap) }))
-      .sort((a, b) => a.demand - b.demand);
-    let remaining = Math.max(0, station);
-    // Max-min fair allocation: serve the smallest demands first; whatever they leave unused is
-    // shared among the rest.
-    byDemand.forEach(({ c, cap, demand: wanted }, index) => {
-      const offered = Math.min(cap, remaining / (byDemand.length - index));
-      result.set(c, offered);
-      remaining -= Math.min(offered, wanted);
-    });
+    const shares = maxMinFairShare(
+      caps.map(({ c, cap }) => ({
+        cap,
+        demand: c.ev ? acceptedPowerW(c.ev.profile, c.ev.soc) : 0,
+      })),
+      station,
+    );
+    caps.forEach(({ c }, index) => result.set(c, shares[index] ?? 0));
     return result;
   }
 

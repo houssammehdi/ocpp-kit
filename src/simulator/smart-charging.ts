@@ -256,6 +256,31 @@ export function compositePeriods(
   return periods;
 }
 
+/**
+ * Share a station-wide power budget among outlets with max-min fairness: the smallest demands
+ * are served first, and whatever an outlet cannot use (its cap or what its EV accepts) goes to
+ * the others.
+ *
+ * @param outlets - per outlet, its own cap and the power its EV would accept (both in W)
+ * @returns the power offered to each outlet, in the order given
+ */
+export function maxMinFairShare(
+  outlets: readonly { readonly cap: number; readonly demand: number }[],
+  budget: number,
+): number[] {
+  const offered = outlets.map(({ cap }) => cap);
+  const order = outlets
+    .map(({ cap, demand }, index) => ({ index, cap, wanted: Math.min(cap, demand) }))
+    .sort((a, b) => a.wanted - b.wanted);
+  let remaining = Math.max(0, budget);
+  order.forEach(({ index, cap, wanted }, position) => {
+    const share = Math.min(cap, remaining / (order.length - position));
+    offered[index] = share;
+    remaining -= Math.min(share, wanted);
+  });
+  return offered;
+}
+
 // ---------------------------------------------------------------------------------------------
 // OCPP 1.6
 // ---------------------------------------------------------------------------------------------
