@@ -1,11 +1,52 @@
+import type { v201 } from '../messages/index.js';
+import type { CompletedCallEvent } from '../rpc/peer.js';
 import { TypedEventEmitter } from '../util/typed-emitter.js';
 import { timerDelay } from '../util/timers.js';
-import { SimulatedCharger, type SimulatedChargerOptions } from './charger.js';
+import { SimulatedCharger, type ChargerStats, type SimulatedChargerOptions } from './charger.js';
 import type { ConnectorStatus } from './connector-state.js';
 import { LatencyTracker, type LatencySummary } from './stats.js';
+import { SimulatedChargingStation, type SimulatedChargingStationOptions } from './v201/station.js';
+
+/**
+ * What a fleet needs from a simulated charge point: {@link SimulatedCharger} (OCPP 1.6) and
+ * {@link SimulatedChargingStation} (OCPP 2.0.1) both qualify.
+ */
+export interface FleetMember {
+  readonly identity: string;
+  start(): Promise<void>;
+  stop(): Promise<void>;
+  stats(): ChargerStats;
+  /** One entry per connector (EVSE for 2.0.1) with its current status. */
+  readonly connectors: readonly { readonly status: string }[];
+  on(event: 'callCompleted', listener: (event: CompletedCallEvent) => void): unknown;
+}
+
+/** What a {@link FleetOptions.create} factory gets for each member. */
+export interface FleetMemberInit {
+  readonly identity: string;
+  readonly url: string;
+  readonly seed: number;
+  /** Zero-based position in the fleet. */
+  readonly index: number;
+}
+
+/** A factory of OCPP 1.6 fleet members with the given charger options. */
+export function chargerFactory(
+  options: Partial<Omit<SimulatedChargerOptions, 'identity' | 'url' | 'seed'>> = {},
+): (init: FleetMemberInit) => SimulatedCharger {
+  return ({ identity, url, seed }) => new SimulatedCharger({ ...options, identity, url, seed });
+}
+
+/** A factory of OCPP 2.0.1 fleet members with the given station options. */
+export function stationFactory(
+  options: Partial<Omit<SimulatedChargingStationOptions, 'identity' | 'url' | 'seed'>> = {},
+): (init: FleetMemberInit) => SimulatedChargingStation {
+  return ({ identity, url, seed }) =>
+    new SimulatedChargingStation({ ...options, identity, url, seed });
+}
 
 /** Options of {@link Fleet}. */
-export interface FleetOptions {
+export interface FleetOptions<M extends FleetMember = SimulatedCharger> {
   /** Central System endpoint without the identity. */
   readonly url: string;
   /** Number of chargers. */
@@ -16,8 +57,14 @@ export interface FleetOptions {
   readonly identityPrefix?: string;
   /** Seed shared by the fleet; each charger derives its own stream from it. Default: 1. */
   readonly seed?: number;
-  /** Options applied to every charger. */
+  /** Options applied to every charger when no `create` factory is given. */
   readonly charger?: Partial<Omit<SimulatedChargerOptions, 'identity' | 'url' | 'seed'>>;
+  /**
+   * Creates each member, e.g. `stationFactory({ evses: 2 })` for an OCPP 2.0.1 fleet or a
+   * function that alternates versions for a mixed one. Default: {@link SimulatedCharger}s with
+   * the `charger` options.
+   */
+  readonly create?: (init: FleetMemberInit) => M;
 }
 
 /** Aggregated fleet state. */
@@ -33,27 +80,35 @@ export interface FleetStats {
   readonly powerKW: number;
   readonly callsSent: number;
   readonly callErrors: number;
-  readonly connectorStatuses: Readonly<Partial<Record<ConnectorStatus, number>>>;
+  /** Connectors by status (OCPP 1.6 and 2.0.1 statuses). */
+  readonly connectorStatuses: Readonly<
+    Partial<Record<ConnectorStatus | v201.ConnectorStatus, number>>
+  >;
   readonly latency: LatencySummary;
 }
 
 /** Events emitted by {@link Fleet}. */
-export interface FleetEvents {
-  chargerStarted: (charger: SimulatedCharger) => void;
-  chargerFailed: (charger: SimulatedCharger, error: Error) => void;
+export interface FleetEvents<M extends FleetMember = SimulatedCharger> {
+  chargerStarted: (charger: M) => void;
+  chargerFailed: (charger: M, error: Error) => void;
 }
 
-/** Spawns and supervises many {@link SimulatedCharger}s for load testing. */
-export class Fleet extends TypedEventEmitter<FleetEvents> {
-  readonly chargers: readonly SimulatedCharger[];
-  readonly #options: FleetOptions;
+/**
+ * Spawns and supervises many simulated charge points for load testing: {@link SimulatedCharger}s
+ * by default, or whatever `create` makes.
+ */
+export class Fleet<M extends FleetMember = SimulatedCharger> extends TypedEventEmitter<
+  FleetEvents<M>
+> {
+  readonly chargers: readonly M[];
+  readonly #options: FleetOptions<M>;
   readonly #latency = new LatencyTracker();
   #started = 0;
   #stopped = false;
   #ramp: NodeJS.Timeout | undefined;
   #rampDone: (() => void) | undefined;
 
-  constructor(options: FleetOptions) {
+  constructor(options: FleetOptions<M>) {
     super();
     if (!Number.isInteger(options.count) || options.count < 1) {
       throw new RangeError('count must be a positive integer');
@@ -61,12 +116,15 @@ export class Fleet extends TypedEventEmitter<FleetEvents> {
     this.#options = options;
     const prefix = options.identityPrefix ?? 'SIM-';
     const width = Math.max(3, String(options.count).length);
+    const create =
+      options.create ??
+      (chargerFactory(options.charger) as unknown as (init: FleetMemberInit) => M);
     this.chargers = Array.from({ length: options.count }, (_, index) => {
-      const charger = new SimulatedCharger({
-        ...options.charger,
+      const charger = create({
         identity: `${prefix}${String(index + 1).padStart(width, '0')}`,
         url: options.url,
         seed: options.seed ?? 1,
+        index,
       });
       charger.on('callCompleted', (event) => this.#latency.record(event.durationMs));
       return charger;
@@ -115,7 +173,7 @@ export class Fleet extends TypedEventEmitter<FleetEvents> {
 
   /** Aggregate statistics over all chargers. */
   stats(): FleetStats {
-    const statuses: Partial<Record<ConnectorStatus, number>> = {};
+    const statuses: Partial<Record<string, number>> = {};
     let connected = 0;
     let registered = 0;
     let activeTransactions = 0;

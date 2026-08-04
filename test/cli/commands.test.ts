@@ -169,3 +169,72 @@ describe('ocpp-kit csms observability', () => {
     expect(stdout.join('')).not.toContain('CSMS stopped.');
   });
 });
+
+describe('ocpp-kit sim --ocpp', () => {
+  async function simulate(
+    version: string,
+    count: number,
+  ): Promise<{ stats: FleetStats; csms: DemoCsms; stderr: string }> {
+    const csms = new DemoCsms();
+    const { port } = await csms.listen(0, '127.0.0.1');
+    const stdout: string[] = [];
+    const stderr: string[] = [];
+    vi.spyOn(process.stdout, 'write').mockImplementation((chunk: string | Uint8Array) => {
+      stdout.push(String(chunk));
+      return true;
+    });
+    vi.spyOn(process.stderr, 'write').mockImplementation((chunk: string | Uint8Array) => {
+      stderr.push(String(chunk));
+      return true;
+    });
+    try {
+      await runSim([
+        '--ocpp',
+        version,
+        '--url',
+        `ws://127.0.0.1:${port}`,
+        '-n',
+        String(count),
+        '--ramp',
+        '100/s',
+        '--no-autopilot',
+        '--duration',
+        '800ms',
+        '--json',
+      ]);
+    } finally {
+      vi.restoreAllMocks();
+    }
+    const stats = JSON.parse(stdout.join('')) as FleetStats;
+    const result = { stats, csms, stderr: stderr.join('') };
+    await csms.close();
+    return result;
+  }
+
+  it('simulates OCPP 2.0.1 stations', async () => {
+    const { stats, csms, stderr } = await simulate('2.0.1', 2);
+    expect(stats).toMatchObject({ chargers: 2, registered: 2, callErrors: 0 });
+    expect(stats.connectorStatuses.Available).toBe(4);
+    expect([...csms.stations.values()].map((station) => station.version)).toEqual([
+      '2.0.1',
+      '2.0.1',
+    ]);
+    expect(stderr).toContain('Simulating 2 charge point(s) (OCPP 2.0.1)');
+  });
+
+  it('simulates a mixed fleet against one Central System', async () => {
+    const { stats, csms } = await simulate('mixed', 4);
+    expect(stats).toMatchObject({ chargers: 4, registered: 4, callErrors: 0 });
+    expect([...csms.stations.values()].map((station) => station.version).sort()).toEqual([
+      '1.6',
+      '1.6',
+      '2.0.1',
+      '2.0.1',
+    ]);
+  });
+
+  it('rejects unknown versions', async () => {
+    await expect(runSim(['--ocpp', '2.1'])).rejects.toThrow(/--ocpp must be/);
+    await expect(runCsms(['--ocpp', '1.5'])).rejects.toThrow(/--ocpp must be/);
+  });
+});

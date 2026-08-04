@@ -1,5 +1,13 @@
 import { parseArgs } from 'node:util';
-import { Fleet, type FleetStats } from '../simulator/fleet.js';
+import type { AutopilotOptions } from '../simulator/charger.js';
+import {
+  chargerFactory,
+  Fleet,
+  stationFactory,
+  type FleetMember,
+  type FleetMemberInit,
+  type FleetStats,
+} from '../simulator/fleet.js';
 import {
   clientTlsFromFlags,
   parseDuration,
@@ -13,21 +21,22 @@ import { formatClock, formatNumber, untilInterrupted } from './format.js';
 
 export const SIM_USAGE = `Usage: ocpp-kit sim [options]
 
-Spawn simulated OCPP 1.6-J charge points against a Central System.
+Spawn simulated charge points against a Central System.
 
 Options:
+      --ocpp <version>        1.6 (default), 2.0.1, or mixed (alternating 1.6 and 2.0.1)
       --url <ws-url>          Central System endpoint without identity (default ws://localhost:9220)
   -n, --count <n>             Number of charge points (default 1)
       --ramp <rate>           Start rate, e.g. 5/s or 120/m (default 10/s)
       --prefix <text>         Identity prefix (default SIM-)
-      --connectors <n>        Connectors per charge point (default 2)
+      --connectors <n>        Connectors (2.0.1: EVSEs) per charge point (default 2)
       --max-power <kW>        Hardware limit per connector (default 22)
       --seed <n>              Seed for deterministic behaviour (default 1)
       --password <secret>     HTTP Basic auth password (Security Profile 1, or 2 over wss)
       --ca <file>             Trust only this CA for wss:// (pins the Central System's CA)
       --cert <file>           Client certificate for Security Profile 3 (with --key)
       --key <file>            Private key of --cert
-      --meter-interval <dur>  MeterValueSampleInterval (default 60s)
+      --meter-interval <dur>  MeterValueSampleInterval / TxUpdatedInterval (default 60s)
       --idle <range>          Idle time between sessions (default 30s-5m)
       --max-session <dur>     Maximum session length (default 4h)
       --no-autopilot          Do not start sessions automatically
@@ -58,6 +67,7 @@ export async function runSim(
   const { values } = parseArgs({
     args: [...argv],
     options: {
+      ocpp: { type: 'string', default: '1.6' },
       url: { type: 'string', default: 'ws://localhost:9220' },
       count: { type: 'string', short: 'n', default: '1' },
       ramp: { type: 'string', default: '10/s' },
@@ -86,26 +96,36 @@ export async function runSim(
   }
   const maxPowerKW = Number(values['max-power']);
   if (!(maxPowerKW > 0)) throw new UsageError('--max-power must be a positive number of kW');
+  const version = values.ocpp;
+  if (version !== '1.6' && version !== '2.0.1' && version !== 'mixed') {
+    throw new UsageError(`--ocpp must be 1.6, 2.0.1 or mixed, got "${version}"`);
+  }
   const tls = clientTlsFromFlags(values);
+  const connectors = parseInteger(values.connectors, 'connectors');
+  const intervalS = Math.round(parseDuration(values['meter-interval']) / 1_000);
+  const autopilot: AutopilotOptions | false = values['no-autopilot']
+    ? false
+    : {
+        idleS: parseRangeSeconds(values.idle),
+        maxSessionS: parseDuration(values['max-session']) / 1_000,
+      };
+  const common = {
+    maxPowerW: maxPowerKW * 1_000,
+    autopilot,
+    ...(values.password === undefined ? {} : { password: values.password }),
+    ...(tls === undefined ? {} : { client: { tls } }),
+  };
+  const v16 = chargerFactory({ ...common, connectors, meterValueSampleIntervalS: intervalS });
+  const v201 = stationFactory({ ...common, evses: connectors, txUpdatedIntervalS: intervalS });
+  const create = (init: FleetMemberInit): FleetMember =>
+    version === '2.0.1' || (version === 'mixed' && init.index % 2 === 1) ? v201(init) : v16(init);
   const fleet = new Fleet({
     url: parseUrl(values.url),
     count: parseInteger(values.count, 'count'),
     ratePerSecond: parseRate(values.ramp),
     identityPrefix: values.prefix,
     seed: parseInteger(values.seed, 'seed', 0),
-    charger: {
-      connectors: parseInteger(values.connectors, 'connectors'),
-      maxPowerW: maxPowerKW * 1_000,
-      meterValueSampleIntervalS: Math.round(parseDuration(values['meter-interval']) / 1_000),
-      autopilot: values['no-autopilot']
-        ? false
-        : {
-            idleS: parseRangeSeconds(values.idle),
-            maxSessionS: parseDuration(values['max-session']) / 1_000,
-          },
-      ...(values.password === undefined ? {} : { password: values.password }),
-      ...(tls === undefined ? {} : { client: { tls } }),
-    },
+    create,
   });
   const durationMs = values.duration === undefined ? undefined : parseDuration(values.duration);
 
@@ -124,7 +144,7 @@ export async function runSim(
   };
   const ticker = setInterval(print, tty ? 1_000 : 5_000);
   info(
-    `Simulating ${fleet.chargers.length} charge point(s) against ${values.url} (Ctrl-C to stop)`,
+    `Simulating ${fleet.chargers.length} charge point(s) (OCPP ${version === 'mixed' ? '1.6 and 2.0.1' : version}) against ${values.url} (Ctrl-C to stop)`,
   );
   void fleet.start();
 
