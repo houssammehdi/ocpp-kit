@@ -2,7 +2,7 @@ import { createServer, type Server } from 'node:http';
 import type { AddressInfo } from 'node:net';
 import { createInterface } from 'node:readline';
 import { parseArgs } from 'node:util';
-import { MessageTrigger } from '../messages/index.js';
+import { MessageTrigger, v201 } from '../messages/index.js';
 import { instrumentCentralSystem } from '../observability/central-system.js';
 import { attachLogger, jsonLines } from '../observability/logging.js';
 import { PROMETHEUS_CONTENT_TYPE } from '../observability/metrics.js';
@@ -18,7 +18,8 @@ import { fit, formatNumber, renderTable, untilInterrupted, type Column } from '.
 
 export const CSMS_USAGE = `Usage: ocpp-kit csms [options]
 
-Run a demo Central System that accepts every charge point and id tag.
+Run a demo Central System that accepts every charge point and id tag, speaking
+OCPP 1.6 and 2.0.1 on the same port (the subprotocol decides per connection).
 
 Options:
   -p, --port <n>            Port to listen on (default 9220)
@@ -31,6 +32,7 @@ Options:
       --client-certs <mode> required (default with --tls-ca) or optional
       --cert-identity <r>   How the identity must match the client certificate:
                             cn-or-san (default), cn, san or none
+      --ocpp <versions>     Versions to accept: both (default), 1.6 or 2.0.1
       --heartbeat <dur>     Heartbeat interval handed out at boot (default 60s)
       --auto-start <dur>    Remote-start an idle connector on every charger each interval
       --metrics-port <n>    Serve Prometheus metrics on http://<host>:<n>/metrics
@@ -42,7 +44,7 @@ Interactive commands (when attached to a terminal):
   start <id> [connector] [idTag]        stop <id> [connector|txId]
   limit <id> <kW|off>                   reset <id> [hard]
   reserve <id> <connector> <idTag> [minutes]    cancel <id> <reservationId>
-  trigger <id> <message> [connector]    config <id> <key> [value]
+  trigger <id> <message> [connector]    config <id> <key> [value] (2.0.1: Component.Variable)
   firmware <id> <url>                   diagnostics <id> <url>
   list   help   quit`;
 
@@ -53,8 +55,11 @@ const COMMAND_DETAILS = `start <id> [connector] [idTag]  stop <id> [connector|tx
 reserve <id> <connector> <idTag> [minutes]  cancel <id> <reservationId>
 trigger <id> <message> [connector]  config <id> <key> [value]  firmware <id> <url>  diagnostics <id> <url>`;
 
+/** TriggerMessage names of both versions; the charge point's version validates the choice. */
 const TRIGGERS: ReadonlySet<string> = new Set(
-  MessageTrigger.anyOf.map((literal: { const: string }) => literal.const),
+  [...MessageTrigger.anyOf, ...v201.MessageTrigger.anyOf].map(
+    (literal: { const: string }) => literal.const,
+  ),
 );
 
 function connectorSummary(station: StationView): string {
@@ -65,6 +70,7 @@ function connectorSummary(station: StationView): string {
 }
 
 const COLUMNS: readonly Column<StationView>[] = [
+  { header: 'OCPP', width: 5, value: (s) => s.version },
   { header: 'CHARGE POINT', width: 14, value: (s) => s.identity },
   { header: 'LINK', width: 7, value: (s) => (s.connected ? 'online' : 'offline') },
   { header: 'MODEL', width: 12, value: (s) => s.model ?? '-' },
@@ -180,7 +186,7 @@ export async function executeCommand(csms: DemoCsms, line: string): Promise<Comm
       return output(
         csms.trigger(
           needIdentity(),
-          message as MessageTrigger,
+          message,
           connector === undefined ? undefined : parseInteger(connector, 'connector', 0),
         ),
       );
@@ -267,6 +273,7 @@ export async function runCsms(
       path: { type: 'string', default: '/' },
       password: { type: 'string' },
       heartbeat: { type: 'string', default: '60s' },
+      ocpp: { type: 'string', default: 'both' },
       'auto-start': { type: 'string' },
       'metrics-port': { type: 'string' },
       'log-json': { type: 'boolean', default: false },
@@ -310,7 +317,19 @@ export async function runCsms(
     }
   };
 
+  const accepted =
+    values.ocpp === 'both'
+      ? (['ocpp2.0.1', 'ocpp1.6'] as const)
+      : values.ocpp === '1.6'
+        ? (['ocpp1.6'] as const)
+        : values.ocpp === '2.0.1'
+          ? (['ocpp2.0.1'] as const)
+          : undefined;
+  if (accepted === undefined) {
+    throw new UsageError(`--ocpp must be both, 1.6 or 2.0.1, got "${values.ocpp}"`);
+  }
   const csms = new DemoCsms({
+    protocols: accepted,
     heartbeatIntervalS,
     basePath: values.path,
     log,
@@ -321,7 +340,7 @@ export async function runCsms(
   const address = await csms.listen(port, values.host);
   const shown = values.host ?? 'localhost';
   log(
-    `listening on ${tls.tls ? 'wss' : 'ws'}://${shown}:${address.port}${values.path === '/' ? '' : values.path}/<identity> (ocpp1.6${tls.clientCertificates ? ', client certificates' : ''})`,
+    `listening on ${tls.tls ? 'wss' : 'ws'}://${shown}:${address.port}${values.path === '/' ? '' : values.path}/<identity> (${accepted.join(', ')}${tls.clientCertificates ? ', client certificates' : ''})`,
   );
   let metricsServer: Server | undefined;
   if (metricsPort !== undefined) {
