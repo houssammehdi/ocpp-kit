@@ -5,7 +5,14 @@ import type { AddressInfo } from 'node:net';
 import type { Duplex } from 'node:stream';
 import type { TLSSocket } from 'node:tls';
 import { WebSocketServer, type WebSocket } from 'ws';
-import { ChargePointToCentralSystem, validatePayload } from '../../src/index.js';
+import {
+  ChargePointToCentralSystem,
+  ChargingStationToCsms,
+  OCPP16_ERROR_CODES,
+  OCPP201_ERROR_CODES,
+  validatePayload,
+  type ActionSchemaMap,
+} from '../../src/index.js';
 
 /**
  * Ways the fixture Central System can be broken, each violating what one conformance check
@@ -45,8 +52,20 @@ export const BREAKAGES = [
   'invalid-server-call', // rpc.server-calls
 ] as const;
 
+/** Breakages of the checks only the OCPP 2.0.1 suite has. */
+export const BREAKAGES_201 = [
+  'updated-error', // transaction.updated
+  'ended-invalid', // transaction.ended
+  'offline-error', // transaction.offline
+  'replay-error', // transaction.replay
+  'ended-unknown-error', // transaction.ended-unknown
+  'security-event-error', // security-event.response
+  'v16-error-codes', // rpc.error-codes
+  'message-type-not-supported', // rpc.unknown-message-type still passes (tolerated code)
+] as const;
+
 /** One way to break the fixture. */
-export type Breakage = (typeof BREAKAGES)[number];
+export type Breakage = (typeof BREAKAGES)[number] | (typeof BREAKAGES_201)[number];
 
 /** Options of {@link FixtureCsms}. */
 export interface FixtureOptions {
@@ -59,14 +78,16 @@ export interface FixtureOptions {
   readonly slowMs?: number;
   /** Registration status handed out. Default: Accepted. */
   readonly bootStatus?: 'Accepted' | 'Pending' | 'Rejected';
+  /** The OCPP version spoken. Default: `ocpp1.6`. */
+  readonly protocol?: 'ocpp1.6' | 'ocpp2.0.1';
 }
 
 type Answer = { readonly payload: Record<string, unknown> } | { readonly error: string };
 
 /**
- * A deliberately small OCPP 1.6-J Central System written directly on `ws`, without ocpp-kit's
- * RPC layer, so that it can break the protocol in ways the library never would. Without
- * breakages it passes every conformance check.
+ * A deliberately small OCPP 1.6-J or 2.0.1 Central System written directly on `ws`, without
+ * ocpp-kit's RPC layer, so that it can break the protocol in ways the library never would.
+ * Without breakages it passes every conformance check of its version.
  */
 export class FixtureCsms {
   readonly #options: FixtureOptions;
@@ -76,6 +97,8 @@ export class FixtureCsms {
   readonly #connections = new Map<string, WebSocket[]>();
   readonly #starts = new Map<string, number>();
   readonly #transactions = new Set<number>();
+  /** 2.0.1: seqNos seen per transaction. */
+  readonly #events = new Map<string, Set<number>>();
   #nextTransactionId = 1;
 
   constructor(options: FixtureOptions = {}) {
@@ -94,13 +117,30 @@ export class FixtureCsms {
       autoPong: !this.broken('no-pong'),
       handleProtocols: (protocols) => {
         if (this.broken('no-subprotocol')) return false;
-        if (protocols.has('ocpp1.6')) return 'ocpp1.6';
+        if (protocols.has(this.protocol)) return this.protocol;
         return this.broken('accept-any-subprotocol') ? ([...protocols][0] ?? false) : false;
       },
     });
     this.#server.on('upgrade', (request: IncomingMessage, socket: Duplex, head: Buffer) => {
       this.#onUpgrade(request, socket, head);
     });
+  }
+
+  /** The subprotocol spoken. */
+  get protocol(): 'ocpp1.6' | 'ocpp2.0.1' {
+    return this.#options.protocol ?? 'ocpp1.6';
+  }
+
+  /** The charge point actions of the version. */
+  get catalogue(): ActionSchemaMap {
+    return this.protocol === 'ocpp2.0.1' ? ChargingStationToCsms : ChargePointToCentralSystem;
+  }
+
+  /** The error codes used, which `v16-error-codes` makes the 1.6 ones on a 2.0.1 connection. */
+  get errorCodes() {
+    return this.protocol === 'ocpp2.0.1' && !this.broken('v16-error-codes')
+      ? OCPP201_ERROR_CODES
+      : OCPP16_ERROR_CODES;
   }
 
   /** Whether `breakage` is switched on. */
@@ -151,8 +191,8 @@ export class FixtureCsms {
   }
 
   #onConnection(ws: WebSocket, identity: string): void {
-    if (ws.protocol !== 'ocpp1.6' && !this.broken('accept-any-subprotocol')) {
-      ws.close(1002, 'ocpp1.6 is required');
+    if (ws.protocol !== this.protocol && !this.broken('accept-any-subprotocol')) {
+      ws.close(1002, `${this.protocol} is required`);
       return;
     }
     const sockets = this.#connections.get(identity) ?? [];
@@ -171,6 +211,11 @@ export class FixtureCsms {
 
   /** The Central System logic: answer one valid Charge Point request. */
   answer(action: string, payload: Record<string, unknown>): Answer {
+    if (this.protocol === 'ocpp2.0.1') return this.#answer201(action, payload);
+    return this.#answer16(action, payload);
+  }
+
+  #answer16(action: string, payload: Record<string, unknown>): Answer {
     const currentTime = new Date().toISOString();
     switch (action) {
       case 'BootNotification':
@@ -247,6 +292,60 @@ export class FixtureCsms {
     }
   }
 
+  #answer201(action: string, payload: Record<string, unknown>): Answer {
+    const currentTime = new Date().toISOString();
+    switch (action) {
+      case 'BootNotification':
+      case 'Heartbeat':
+      case 'DataTransfer':
+        // Same shapes as in 1.6.
+        return this.#answer16(action, payload);
+      case 'StatusNotification':
+        return { payload: this.broken('status-invalid') ? { ok: true } : {} };
+      case 'Authorize':
+        return {
+          payload: this.broken('authorize-invalid')
+            ? { status: 'Accepted' }
+            : { idTokenInfo: { status: 'Accepted' } },
+        };
+      case 'TransactionEvent': {
+        const info = payload.transactionInfo as { transactionId: string };
+        const seqNo = payload.seqNo as number;
+        const seen = this.#events.get(info.transactionId);
+        const known = seen !== undefined;
+        if (seen?.has(seqNo) && this.broken('replay-error'))
+          return { error: 'PropertyConstraintViolation' };
+        if (payload.offline === true && this.broken('offline-error'))
+          return { error: 'InternalError' };
+        const events = seen ?? new Set<number>();
+        events.add(seqNo);
+        if (payload.eventType === 'Started') this.#events.set(info.transactionId, events);
+        switch (payload.eventType) {
+          case 'Started':
+            return {
+              payload: {
+                idTokenInfo: { status: this.broken('start-invalid') ? 'Fine' : 'Accepted' },
+              },
+            };
+          case 'Updated':
+            return this.broken('updated-error') ? { error: 'InternalError' } : { payload: {} };
+          default:
+            if (!known && this.broken('ended-unknown-error'))
+              return { error: 'PropertyConstraintViolation' };
+            if (known && this.broken('ended-invalid')) return { payload: { totalCost: 'free' } };
+            this.#events.delete(info.transactionId);
+            return { payload: {} };
+        }
+      }
+      case 'MeterValues':
+        return this.broken('main-meter-error') ? { error: 'InternalError' } : { payload: {} };
+      case 'SecurityEventNotification':
+        return this.broken('security-event-error') ? { error: 'NotSupported' } : { payload: {} };
+      default:
+        return { payload: { currentTime } };
+    }
+  }
+
   /** Delay of every answer. */
   get answerDelayMs(): number {
     return this.broken('slow') ? (this.#options.slowMs ?? 50) : 0;
@@ -304,6 +403,8 @@ class FixtureSession {
       default:
         if (this.fixture.broken('answer-unknown-type')) {
           this.#send([4, id, 'ProtocolError', 'Unknown message type', {}]);
+        } else if (this.fixture.broken('message-type-not-supported')) {
+          this.#send([4, id, 'MessageTypeNotSupported', 'Unknown message type', {}]);
         }
     }
   }
@@ -319,10 +420,11 @@ class FixtureSession {
       id.length > 36
     ) {
       if (!this.fixture.broken('ignore-malformed-frames')) {
+        const codes = this.fixture.errorCodes;
         this.#send([
           4,
           id,
-          frame.length < 4 ? 'ProtocolError' : 'FormationViolation',
+          frame.length < 4 ? codes.incompleteFrame : codes.rpcFramework,
           'Malformed CALL',
           {},
         ]);
@@ -330,7 +432,8 @@ class FixtureSession {
       return;
     }
     const request = payload as Record<string, unknown>;
-    if (!Object.hasOwn(ChargePointToCentralSystem, action)) {
+    const catalogue = this.fixture.catalogue;
+    if (!Object.hasOwn(catalogue, action)) {
       if (this.fixture.broken('ignore-unknown-action')) return;
       const code = this.fixture.broken('unknown-action-not-supported')
         ? 'NotSupported'
@@ -339,8 +442,10 @@ class FixtureSession {
       return;
     }
     if (!this.fixture.broken('no-validation')) {
-      const schema = ChargePointToCentralSystem[action as keyof typeof ChargePointToCentralSystem];
-      const error = validatePayload(schema.request, request);
+      const schema = catalogue[action];
+      const error = schema
+        ? validatePayload(schema.request, request, 'Payload', this.fixture.errorCodes)
+        : undefined;
       if (error) {
         this.#send([4, id, error.code, error.message, {}]);
         return;
@@ -359,12 +464,22 @@ class FixtureSession {
 
   /** Configure the charge point after it registered, like many Central Systems do. */
   #afterBoot(): void {
+    const modern = this.fixture.protocol === 'ocpp2.0.1';
     this.#queue.push(
-      ['GetConfiguration', {}],
+      modern
+        ? [
+            'GetVariables',
+            {
+              getVariableData: [
+                { component: { name: 'OCPPCommCtrlr' }, variable: { name: 'HeartbeatInterval' } },
+              ],
+            },
+          ]
+        : ['GetConfiguration', {}],
       ['TriggerMessage', { requestedMessage: 'StatusNotification' }],
     );
     if (this.fixture.broken('invalid-server-call'))
-      this.#queue.push(['RemoteStartTransaction', {}]);
+      this.#queue.push([modern ? 'RequestStartTransaction' : 'RemoteStartTransaction', {}]);
     if (this.fixture.broken('concurrent-calls')) {
       for (const [action, payload] of this.#queue.splice(0)) {
         this.ws.send(JSON.stringify([2, randomUUID(), action, payload]));

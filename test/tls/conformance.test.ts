@@ -1,6 +1,11 @@
 import { afterAll, afterEach, beforeAll, describe, expect, it } from 'vitest';
 import { DemoCsms } from '../../src/cli/demo-csms.js';
-import { ocpp16Conformance, runConformance, type ConformanceReport } from '../../src/index.js';
+import {
+  ocpp16Conformance,
+  ocpp201Conformance,
+  runConformance,
+  type ConformanceReport,
+} from '../../src/index.js';
 import { FixtureCsms } from '../conformance/fixture-csms.js';
 import { createTestPki, opensslAvailable, type TestPki } from './pki.js';
 
@@ -95,5 +100,39 @@ describeTls('conformance checks over TLS', () => {
       status: 'fail',
       message: 'accepted a connection without a client certificate or password',
     });
+  });
+
+  it('check Security Profile 3 of a 2.0.1 CSMS, and fail one that accepts no certificate', async () => {
+    const tls = { cert: pki.server.cert, key: pki.server.key, ca: pki.ca.cert };
+    const demo = new DemoCsms({ tls, clientCertificates: {} });
+    const { port } = await demo.listen(0, '127.0.0.1');
+    cleanups.push(() => demo.close());
+    const report = await runConformance(ocpp201Conformance, {
+      url: `wss://127.0.0.1:${port}`,
+      identity: 'CS-TLS-CONF',
+      tls: { ca: pki.ca.cert, ...pki.client('CS-TLS-CONF') },
+      ...FAST,
+      only: ['ws.subprotocol', 'tls.', 'boot.response'],
+    });
+    expect(statuses(report)).toEqual({
+      'ws.subprotocol': 'pass',
+      'tls.client-certificate': 'pass',
+      'boot.response': 'pass',
+    });
+    const broken = new FixtureCsms({
+      protocol: 'ocpp2.0.1',
+      tls,
+      breakages: ['accept-without-certificate'],
+    });
+    const url = await broken.listen();
+    cleanups.push(() => broken.close());
+    const failed = await runConformance(ocpp201Conformance, {
+      url,
+      identity: 'CS-FIXTURE',
+      tls: { ca: pki.ca.cert, ...pki.client('CS-FIXTURE') },
+      ...FAST,
+      only: ['tls.client-certificate'],
+    });
+    expect(failed.results[0]?.status).toBe('fail');
   });
 });

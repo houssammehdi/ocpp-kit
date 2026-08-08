@@ -70,7 +70,10 @@ function positive(value: number | undefined, fallback: number, name: string): nu
   return value;
 }
 
-function resolveOptions(options: ConformanceOptions): ResolvedConformanceOptions {
+function resolveOptions(
+  suite: ConformanceSuite,
+  options: ConformanceOptions,
+): ResolvedConformanceOptions {
   let url: URL;
   try {
     url = new URL(options.url);
@@ -82,8 +85,11 @@ function resolveOptions(options: ConformanceOptions): ResolvedConformanceOptions
   }
   if (options.identity.length === 0) throw new ConformanceOptionsError('The identity is empty');
   const idTag = options.idTag ?? DEFAULTS.idTag;
-  if (idTag.length === 0 || idTag.length > 20) {
-    throw new ConformanceOptionsError('The id tag must be 1 to 20 characters long (CiString20)');
+  const maxIdTag = suite.idTagMaxLength ?? 20;
+  if (idTag.length === 0 || idTag.length > maxIdTag) {
+    throw new ConformanceOptionsError(
+      `The id tag must be 1 to ${maxIdTag} characters long${maxIdTag === 20 ? ' (CiString20)' : ''}`,
+    );
   }
   return {
     url: options.url,
@@ -253,7 +259,7 @@ export async function runConformance(
   suite: ConformanceSuite,
   options: ConformanceOptions,
 ): Promise<ConformanceReport> {
-  const resolved = resolveOptions(options);
+  const resolved = resolveOptions(suite, options);
   const { selected, unknown } = selectChecks(suite.checks, options.only, options.skip);
   if (unknown.length > 0) {
     throw new ConformanceOptionsError(

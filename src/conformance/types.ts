@@ -167,4 +167,9 @@ export interface ConformanceSuite {
   readonly checks: readonly Check[];
   /** Answers the Central System's CALLs on every probe connection. */
   readonly respond: ProbeResponder;
+  /**
+   * Longest id tag the version allows (1.6 `CiString20`, 2.0.1 `idToken` of 36 characters).
+   * Default: 20.
+   */
+  readonly idTagMaxLength?: number;
 }
