@@ -32,10 +32,13 @@ jobs:
       - name: Check that the benchmarks run (the numbers mean nothing on shared runners)
         run: npm run bench -- --quick
       - name: Smoke-test the CLI
-        run: node dist/cli/main.js --version && node dist/cli/main.js sim --help > /dev/null
+        run: |
+          node dist/cli/main.js --version
+          node dist/cli/main.js sim --help > /dev/null
+          node dist/cli/main.js conform --ocpp 2.0.1 --list > /dev/null
 
   conformance:
-    name: Conformance of the demo CSMS
+    name: Conformance of the demo CSMS (OCPP 1.6 and 2.0.1)
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
@@ -45,7 +48,7 @@ jobs:
           cache: npm
       - run: npm ci
       - run: npm run build
-      - name: Run the conformance checker against the demo CSMS
+      - name: Run both conformance suites against the demo CSMS (one port, both versions)
         run: |
           node dist/cli/main.js csms --port 9220 --host 127.0.0.1 --no-table \
             --password ci-password-1234 --auto-start 1s > csms.log 2>&1 &
@@ -58,10 +61,17 @@ jobs:
             --password ci-password-1234
           node dist/cli/main.js conform --url ws://127.0.0.1:9220 --identity CI-JUNIT \
             --password ci-password-1234 --format junit --output conformance-junit.xml
+          node dist/cli/main.js conform --ocpp 2.0.1 --url ws://127.0.0.1:9220 \
+            --identity CI-CONFORMANCE-201 --password ci-password-1234
+          node dist/cli/main.js conform --ocpp 2.0.1 --url ws://127.0.0.1:9220 \
+            --identity CI-JUNIT-201 --password ci-password-1234 \
+            --format junit --output conformance-201-junit.xml
           kill "$csms"
       - uses: actions/upload-artifact@v4
         if: always()
         with:
           name: conformance-report
-          path: conformance-junit.xml
+          path: |
+            conformance-junit.xml
+            conformance-201-junit.xml
           if-no-files-found: ignore

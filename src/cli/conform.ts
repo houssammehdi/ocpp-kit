@@ -8,24 +8,28 @@ import {
   type ReportFormat,
 } from '../conformance/report.js';
 import { conforms, runConformance, selectChecks } from '../conformance/runner.js';
-import type { CheckResult, ConformanceOptions } from '../conformance/types.js';
+import type { CheckResult, ConformanceOptions, ConformanceSuite } from '../conformance/types.js';
 import { ocpp16Conformance } from '../conformance/v16/index.js';
+import { ocpp201Conformance } from '../conformance/v201/index.js';
 import { VERSION } from '../version.js';
 import { clientTlsFromFlags, parseDuration, parseInteger, parseUrl, UsageError } from './args.js';
 
 export const CONFORM_USAGE = `Usage: ocpp-kit conform --url <ws-url> --identity <id> [options]
 
-Check a Central System against OCPP 1.6-J: connect to it as a charge point, run
-every check and report each one with its specification reference and level.
+Check a Central System against OCPP 1.6-J or 2.0.1: connect to it as a charge
+point, run every check and report each one with its specification reference and
+level.
 
 Options:
+      --ocpp <version>        1.6 (default) or 2.0.1
       --url <ws-url>          Central System endpoint without the identity (required)
       --identity <id>         Charge point identity to connect as (required)
       --password <secret>     HTTP Basic auth password (Security Profiles 1 and 2)
       --ca <file>             Trust this CA for wss://
       --cert <file>           Client certificate for Security Profile 3 (with --key)
       --key <file>            Private key of --cert
-      --id-tag <tag>          Id tag for Authorize and the test transactions (default OCPPKIT-PROBE)
+      --id-tag <tag>          Id tag (2.0.1: idToken of type Central) for Authorize and the
+                              test transactions (default OCPPKIT-PROBE)
       --format <format>       text (default), json or junit
       --output <file>         Write the report to this file instead of stdout
       --timeout <dur>         Wait this long for each answer (default 10s)
@@ -41,9 +45,10 @@ Exit status: 0 when every MUST check passed or was skipped, 1 when a MUST check
 failed or could not be carried out, 2 on invalid usage.
 
 The checks send test traffic: a BootNotification, StatusNotifications for
-connectors 0 to 2, an Authorize, a few short transactions (StartTransaction,
-MeterValues, StopTransaction) with the id tag above, and deliberately invalid
-frames. Run them against a test system or with an identity reserved for testing.`;
+connectors 0 to 2 (2.0.1: EVSEs 1 and 2), an Authorize, a few short transactions
+(1.6: StartTransaction, MeterValues, StopTransaction; 2.0.1: TransactionEvent)
+with the id tag above, and deliberately invalid frames. Run them against a test
+system or with an identity reserved for testing.`;
 
 const FORMATS: readonly ReportFormat[] = ['text', 'json', 'junit'];
 
@@ -55,10 +60,22 @@ function list(values: string | undefined): string[] | undefined {
     .filter((value) => value.length > 0);
 }
 
+/** The suite of `--ocpp`. */
+function suiteFor(version: string | undefined): ConformanceSuite {
+  switch (version ?? '1.6') {
+    case '1.6':
+      return ocpp16Conformance;
+    case '2.0.1':
+      return ocpp201Conformance;
+    default:
+      throw new UsageError(`--ocpp must be 1.6 or 2.0.1, got "${version ?? ''}"`);
+  }
+}
+
 /** The check table printed by `--list`. */
-export function formatCheckList(): string {
-  const width = Math.max(...ocpp16Conformance.checks.map((check) => check.id.length));
-  return ocpp16Conformance.checks
+export function formatCheckList(suite: ConformanceSuite = ocpp16Conformance): string {
+  const width = Math.max(...suite.checks.map((check) => check.id.length));
+  return suite.checks
     .map(
       (check) =>
         `${check.id.padEnd(width)}  ${check.level.padEnd(6)}  ${check.title}\n${' '.repeat(width + 10)}${check.spec}`,
@@ -76,6 +93,7 @@ export async function runConform(argv: readonly string[]): Promise<number> {
   const { values } = parseArgs({
     args: [...argv],
     options: {
+      ocpp: { type: 'string' },
       url: { type: 'string' },
       identity: { type: 'string' },
       password: { type: 'string' },
@@ -101,8 +119,9 @@ export async function runConform(argv: readonly string[]): Promise<number> {
     console.log(CONFORM_USAGE);
     return 0;
   }
+  const suite = suiteFor(values.ocpp);
   if (values.list) {
-    console.log(formatCheckList());
+    console.log(formatCheckList(suite));
     return 0;
   }
   if (values.url === undefined) throw new UsageError('--url is required');
@@ -114,12 +133,13 @@ export async function runConform(argv: readonly string[]): Promise<number> {
     throw new UsageError(`--format must be text, json or junit, got "${values.format}"`);
   }
   const idTag = values['id-tag'];
-  if (idTag !== undefined && (idTag.length === 0 || idTag.length > 20)) {
-    throw new UsageError('--id-tag must be 1 to 20 characters long');
+  const maxIdTag = suite.idTagMaxLength ?? 20;
+  if (idTag !== undefined && (idTag.length === 0 || idTag.length > maxIdTag)) {
+    throw new UsageError(`--id-tag must be 1 to ${maxIdTag} characters long`);
   }
   const only = list(values.only);
   const skip = list(values.skip);
-  const { unknown } = selectChecks(ocpp16Conformance.checks, only, skip);
+  const { unknown } = selectChecks(suite.checks, only, skip);
   if (unknown.length > 0) {
     throw new UsageError(`No check matches ${unknown.join(', ')} (see --list)`);
   }
@@ -164,12 +184,12 @@ export async function runConform(argv: readonly string[]): Promise<number> {
       formatTextHeader({
         url: options.url,
         identity: options.identity,
-        protocol: ocpp16Conformance.protocol,
+        protocol: suite.protocol,
         version: VERSION,
       }),
     );
   }
-  const report = await runConformance(ocpp16Conformance, options);
+  const report = await runConformance(suite, options);
   if (live) {
     progress(formatTextSummary(report));
   } else if (output === undefined) {

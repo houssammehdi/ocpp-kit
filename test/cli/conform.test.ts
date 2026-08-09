@@ -3,7 +3,7 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { formatCheckList, runConform } from '../../src/cli/conform.js';
-import { OCPP16_CHECKS, type ConformanceReport } from '../../src/index.js';
+import { OCPP16_CHECKS, OCPP201_CHECKS, type ConformanceReport } from '../../src/index.js';
 import { FixtureCsms, type FixtureOptions } from '../conformance/fixture-csms.js';
 
 const cleanups: (() => Promise<unknown>)[] = [];
@@ -149,5 +149,49 @@ describe('ocpp-kit conform', () => {
     await expect(runConform([...base, '--samples', '0'])).rejects.toThrow(/--samples/);
     await expect(runConform([...base, '--cert', 'c.pem'])).rejects.toThrow(/--cert needs --key/);
     await expect(runConform([...base, '--bogus'])).rejects.toThrow(/Unknown option/);
+  });
+});
+
+describe('ocpp-kit conform --ocpp 2.0.1', () => {
+  it('lists and runs the 2.0.1 checks', async () => {
+    expect(await runConform(['--ocpp', '2.0.1', '--list'])).toBe(0);
+    const listing = logged.at(-1) ?? '';
+    for (const check of OCPP201_CHECKS) expect(listing).toContain(check.id);
+    expect(listing).toContain('transaction.started');
+    const url = await fixture({ protocol: 'ocpp2.0.1' });
+    const status = await runConform([
+      '--ocpp',
+      '2.0.1',
+      '--url',
+      url,
+      '--identity',
+      'CLI-201',
+      '--id-tag',
+      'A-36-CHARACTER-IDTOKEN-IS-FINE-HERE',
+      ...FAST,
+      '--only',
+      'boot,transaction',
+    ]);
+    expect(status).toBe(0);
+    const text = stdout.join('');
+    expect(text).toContain('conformance check: OCPP 2.0.1 Central System');
+    expect(text).toContain('PASS   MUST    transaction.started');
+    expect(text).toContain('Result: PASS');
+  });
+
+  it('refuses unknown versions and id tags longer than an idToken', async () => {
+    await expect(runConform(['--ocpp', '2.1', '--list'])).rejects.toThrow(/--ocpp must be/);
+    await expect(
+      runConform([
+        '--ocpp',
+        '2.0.1',
+        '--url',
+        'ws://x',
+        '--identity',
+        'I',
+        '--id-tag',
+        'X'.repeat(37),
+      ]),
+    ).rejects.toThrow(/1 to 36 characters/);
   });
 });
