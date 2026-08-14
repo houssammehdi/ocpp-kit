@@ -1,11 +1,12 @@
 /**
- * ocpp-kit benchmarks: frame parsing and serialisation, RPC round trips in memory and over a
- * loopback WebSocket, and a fleet load test. Everything runs in one Node.js process, so the
- * WebSocket and fleet numbers include the work of both ends.
+ * ocpp-kit benchmarks: frame parsing, serialisation and validation (OCPP 1.6 and 2.0.1), RPC
+ * round trips in memory and over a loopback WebSocket, an OCPP 1.6 fleet load test and a mixed
+ * 1.6/2.0.1 fleet load test. Everything runs in one Node.js process, so the WebSocket and fleet
+ * numbers include the work of both ends.
  *
  *   npm run bench                     # full run, prints a Markdown table
  *   npm run bench -- --quick          # small counts, to check that everything runs
- *   npm run bench -- --only fleet     # one group: frames, rpc, ws or fleet
+ *   npm run bench -- --only fleet     # one group: frames, rpc, ws, fleet or mixed
  *   npm run bench -- --json           # machine-readable results
  *
  * Timings depend on the machine and on what else runs on it; the load average is printed before
@@ -19,13 +20,20 @@ import {
   CentralSystemToChargePoint,
   ChargePoint,
   ChargePointToCentralSystem,
+  ChargingStation,
+  ChargingStationToCsms,
   createDuplexPair,
+  CsmsToChargingStation,
   LatencyTracker,
+  OCPP201_ERROR_CODES,
   parseFrame,
   RpcPeer,
   serializeFrame,
+  validatePayload,
   type ChargePointRequest,
   type Frame,
+  type OcppSubprotocol,
+  type StationRequest,
 } from '../src/index.js';
 
 const { values } = parseArgs({
@@ -123,6 +131,65 @@ const meterValuesCall: Frame = {
   action: 'MeterValues',
   payload: meterValues,
 };
+/** The OCPP 2.0.1 counterpart of `meterValues`: a periodic TransactionEvent update. */
+const transactionEvent: StationRequest<'TransactionEvent'> = {
+  eventType: 'Updated',
+  timestamp: '2026-09-25T12:00:00.000Z',
+  triggerReason: 'MeterValuePeriodic',
+  seqNo: 7,
+  transactionInfo: {
+    transactionId: '0b6f8a52-3c1d-4e7f-9a2b-6c5d4e3f2a1b',
+    chargingState: 'Charging',
+  },
+  evse: { id: 1, connectorId: 1 },
+  meterValue: [
+    {
+      timestamp: '2026-09-25T12:00:00.000Z',
+      sampledValue: [
+        {
+          value: 12345.6,
+          context: 'Sample.Periodic',
+          measurand: 'Energy.Active.Import.Register',
+          location: 'Outlet',
+          unitOfMeasure: { unit: 'Wh' },
+        },
+        {
+          value: 7360,
+          context: 'Sample.Periodic',
+          measurand: 'Power.Active.Import',
+          unitOfMeasure: { unit: 'W' },
+        },
+        {
+          value: 32,
+          context: 'Sample.Periodic',
+          measurand: 'Current.Import',
+          phase: 'L1',
+          unitOfMeasure: { unit: 'A' },
+        },
+        {
+          value: 230.1,
+          context: 'Sample.Periodic',
+          measurand: 'Voltage',
+          phase: 'L1-N',
+          unitOfMeasure: { unit: 'V' },
+        },
+        {
+          value: 57,
+          context: 'Sample.Periodic',
+          measurand: 'SoC',
+          location: 'EV',
+          unitOfMeasure: { unit: 'Percent' },
+        },
+      ],
+    },
+  ],
+};
+const transactionEventCall: Frame = {
+  type: 2,
+  messageId: '9c8b7a6d-5e4f-4a3b-8c2d-1e0f9a8b7c6d',
+  action: 'TransactionEvent',
+  payload: transactionEvent,
+};
 const heartbeatResult: Frame = {
   type: 3,
   messageId: '5f3d4c2a-9b1e-4f7a-8c6d-2e1f0a9b8c7d',
@@ -145,6 +212,9 @@ function benchFrames(): void {
   const repetitions = QUICK ? 1 : 5;
   const meterValuesRaw = serializeFrame(meterValuesCall);
   const heartbeatRaw = serializeFrame(heartbeatResult);
+  const transactionEventRaw = serializeFrame(transactionEventCall);
+  const meterValuesSchema = ChargePointToCentralSystem.MeterValues.request;
+  const transactionEventSchema = ChargingStationToCsms.TransactionEvent.request;
   const cases: [string, () => number][] = [
     [
       `parseFrame, MeterValues CALL (${meterValuesRaw.length} bytes)`,
@@ -155,6 +225,30 @@ function benchFrames(): void {
       () => (parseFrame(heartbeatRaw).ok ? 1 : 0),
     ],
     ['serializeFrame, MeterValues CALL', () => serializeFrame(meterValuesCall).length],
+    [
+      'validatePayload, MeterValues request (1.6)',
+      () => (validatePayload(meterValuesSchema, meterValues) === undefined ? 1 : 0),
+    ],
+    [
+      `parseFrame, 2.0.1 TransactionEvent CALL (${transactionEventRaw.length} bytes)`,
+      () => (parseFrame(transactionEventRaw, OCPP201_ERROR_CODES).ok ? 1 : 0),
+    ],
+    [
+      'serializeFrame, 2.0.1 TransactionEvent CALL',
+      () => serializeFrame(transactionEventCall).length,
+    ],
+    [
+      'validatePayload, 2.0.1 TransactionEvent request',
+      () =>
+        validatePayload(
+          transactionEventSchema,
+          transactionEvent,
+          'Payload',
+          OCPP201_ERROR_CODES,
+        ) === undefined
+          ? 1
+          : 0,
+    ],
   ];
   for (const [name, fn] of cases) {
     const before = load();
@@ -233,20 +327,56 @@ async function benchRpcMemory(): Promise<void> {
       before,
     );
   }
+  {
+    const before = load();
+    const runs: RoundTrips[] = [];
+    for (let r = 0; r < repetitions; r++) {
+      const [a, b] = createDuplexPair();
+      const station = new RpcPeer(a, {
+        inbound: CsmsToChargingStation,
+        outbound: ChargingStationToCsms,
+        errorCodes: OCPP201_ERROR_CODES,
+      });
+      const csms = new RpcPeer(b, {
+        inbound: ChargingStationToCsms,
+        outbound: CsmsToChargingStation,
+        errorCodes: OCPP201_ERROR_CODES,
+      });
+      csms.handle('TransactionEvent', () => ({}));
+      runs.push(
+        await sequentialCalls(count, () => station.call('TransactionEvent', transactionEvent)),
+      );
+      await station.close();
+    }
+    const result = median(runs, (run) => run.callsPerSecond);
+    report(
+      'rpc',
+      'in memory, sequential 2.0.1 TransactionEvent (5 samples), validation on',
+      describeRoundTrips(result),
+      { ...result },
+      before,
+    );
+  }
 }
 
 // ---------------------------------------------------------------------------------------------
 // WebSocket
 
-async function server(): Promise<{ cs: CentralSystem; url: string }> {
-  const cs = new CentralSystem({ pingIntervalMs: 0 });
-  cs.handle('BootNotification', () => ({
-    status: 'Accepted',
+/** A Central System that accepts OCPP 1.6 and 2.0.1 and answers the messages benchmarked here. */
+async function server(): Promise<{ cs: CentralSystem<OcppSubprotocol>; url: string }> {
+  const cs = new CentralSystem<OcppSubprotocol>({
+    pingIntervalMs: 0,
+    protocols: ['ocpp2.0.1', 'ocpp1.6'],
+  });
+  const boot = () => ({
+    status: 'Accepted' as const,
     currentTime: new Date().toISOString(),
     interval: 3_600,
-  }));
+  });
+  cs.handle('BootNotification', boot);
   cs.handle('Heartbeat', () => ({ currentTime: new Date().toISOString() }));
   cs.handle('MeterValues', () => ({}));
+  cs.v201.handle('BootNotification', boot).handle('TransactionEvent', () => ({}));
   const { port } = await cs.listen(0, '127.0.0.1');
   return { cs, url: `ws://127.0.0.1:${port}` };
 }
@@ -256,6 +386,16 @@ async function bootedClient(url: string, identity: string): Promise<ChargePoint>
   await cp.connect();
   await cp.call('BootNotification', { chargePointVendor: 'ocpp-kit', chargePointModel: 'bench' });
   return cp;
+}
+
+async function bootedStation(url: string, identity: string): Promise<ChargingStation> {
+  const station = new ChargingStation({ identity, url, reconnect: false });
+  await station.connect();
+  await station.call('BootNotification', {
+    chargingStation: { vendorName: 'ocpp-kit', model: 'bench' },
+    reason: 'PowerUp',
+  });
+  return station;
 }
 
 async function benchWebSocket(): Promise<void> {
@@ -321,24 +461,49 @@ async function benchWebSocket(): Promise<void> {
 // ---------------------------------------------------------------------------------------------
 // Fleet
 
-async function fleetRun(chargers: number, ratePerCharger: number, seconds: number) {
+/** One client of a fleet run, sending its version's meter-value message. */
+interface FleetClient {
+  readonly client: ChargePoint | ChargingStation;
+  readonly send: () => Promise<unknown>;
+}
+
+async function fleetClient(url: string, index: number, v201: boolean): Promise<FleetClient> {
+  if (!v201) {
+    const cp = await bootedClient(url, `FLEET-${index}`);
+    return { client: cp, send: () => cp.call('MeterValues', meterValues) };
+  }
+  const station = await bootedStation(url, `FLEET-${index}`);
+  let seqNo = 0;
+  return {
+    client: station,
+    send: () => station.call('TransactionEvent', { ...transactionEvent, seqNo: seqNo++ }),
+  };
+}
+
+/**
+ * `chargers` clients send meter values at `ratePerCharger` messages per second for `seconds`;
+ * every `v201Every`-th client (none when 0) is an OCPP 2.0.1 Charging Station sending
+ * TransactionEvent updates, the others are OCPP 1.6 charge points sending MeterValues.
+ */
+async function fleetRun(chargers: number, ratePerCharger: number, seconds: number, v201Every = 0) {
   const { cs, url } = await server();
-  const cps: ChargePoint[] = [];
+  const clients: FleetClient[] = [];
   for (let i = 0; i < chargers; i += 50) {
-    cps.push(
+    clients.push(
       ...(await Promise.all(
         Array.from({ length: Math.min(50, chargers - i) }, (_, j) =>
-          bootedClient(url, `FLEET-${i + j}`),
+          fleetClient(url, i + j, v201Every > 0 && (i + j) % v201Every === 0),
         ),
       )),
     );
   }
+  const cps = clients.map(({ client }) => client);
   const tracker = new LatencyTracker(Math.ceil(chargers * ratePerCharger * seconds * 1.2));
   let answered = 0;
   let failed = 0;
   for (const cp of cps) {
     cp.on('dropped', () => failed++);
-    cp.on('callCompleted', (event) => {
+    cp.on('callCompleted', (event: { readonly error?: unknown; readonly durationMs: number }) => {
       if (event.error) failed++;
       else {
         answered++;
@@ -351,10 +516,10 @@ async function fleetRun(chargers: number, ratePerCharger: number, seconds: numbe
   const cpuBefore = process.cpuUsage();
   const start = performance.now();
   const interval = 1_000 / ratePerCharger;
-  const timers = cps.map((cp, i) => {
+  const timers = clients.map((client, i) => {
     let timer: NodeJS.Timeout | undefined;
     const send = (): void => {
-      void cp.call('MeterValues', meterValues).catch(() => undefined);
+      void client.send().catch(() => undefined);
     };
     // Spread the chargers evenly over one interval so they do not send in lockstep.
     const first = setTimeout(
@@ -416,6 +581,29 @@ async function benchFleet(): Promise<void> {
   }
 }
 
+async function benchMixedFleet(): Promise<void> {
+  const scenarios: [number, number, number][] = QUICK
+    ? [[20, 2, 2]]
+    : [
+        [1_000, 2, 20],
+        [2_000, 2, 20],
+      ];
+  const repetitions = QUICK ? 1 : 3;
+  for (const [chargers, rate, seconds] of scenarios) {
+    const before = load();
+    const runs = [];
+    for (let r = 0; r < repetitions; r++) runs.push(await fleetRun(chargers, rate, seconds, 2));
+    const result = median(runs, (run) => run.p95);
+    report(
+      'mixed',
+      `${fmt(chargers / 2)} OCPP 1.6 (MeterValues) + ${fmt(chargers / 2)} OCPP 2.0.1 (TransactionEvent) x ${rate} msg/s for ${seconds} s`,
+      `${fmt(result.achieved)} of ${fmt(result.offered)} msg/s answered, ${result.failed} failed, RTT p50 ${fmt(result.p50, 2)} ms, p95 ${fmt(result.p95, 2)} ms, p99 ${fmt(result.p99, 2)} ms, CPU ${fmt(result.cpuPercent)} % of one core, event-loop lag p99 ${fmt(result.lagP99, 1)} ms`,
+      { ...result },
+      before,
+    );
+  }
+}
+
 // ---------------------------------------------------------------------------------------------
 
 const groups: Record<string, () => void | Promise<void>> = {
@@ -423,6 +611,7 @@ const groups: Record<string, () => void | Promise<void>> = {
   rpc: benchRpcMemory,
   ws: benchWebSocket,
   fleet: benchFleet,
+  mixed: benchMixedFleet,
 };
 if (values.only !== undefined && !(values.only in groups)) {
   throw new Error(`--only must be one of ${Object.keys(groups).join(', ')}`);
