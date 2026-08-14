@@ -56,7 +56,8 @@
     "docs": "typedoc",
     "example:csms": "tsx examples/basic-csms.ts",
     "example:charge-point": "tsx examples/basic-charge-point.ts",
-    "example:smart-charging": "tsx examples/smart-charging.ts"
+    "example:smart-charging": "tsx examples/smart-charging.ts",
+    "example:multi-version": "tsx examples/multi-version.ts"
   },
   "dependencies": {
     "@sinclair/typebox": "^0.34.52",
