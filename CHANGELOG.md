@@ -5,6 +5,69 @@ All notable changes to this project are documented in this file. The format is b
 [Semantic Versioning](https://semver.org/spec/v2.0.0.html). Before 1.0.0, minor versions may
 contain breaking changes.
 
+## 0.3.0 - 2026-09-26
+
+### Added
+
+- OCPP 2.0.1: a hand-written TypeBox catalogue of 40 of the 64 messages
+  (`ChargingStationToCsms`, `CsmsToChargingStation`, the `v201` namespace of types,
+  `FUNCTIONAL_BLOCKS`, `ACTION_BLOCKS`, and `UNSUPPORTED_ACTIONS_201` for the 24 left out),
+  compared field by field with the official JSON schemas.
+- `OcppProtocol`, with `OCPP16_PROTOCOL` and `OCPP201_PROTOCOL`: what the server, the clients
+  and the conformance suites need to know about a version.
+- The OCPP-J 2.0.1 error codes (`Ocpp201ErrorCodes`, `OCPP201_ERROR_CODES`), and `ErrorCodeSet`
+  so that `parseFrame`, `validatePayload` and `RpcPeer` (`errorCodes` option) report faults in
+  the vocabulary of the connection's version. Codes thrown by handlers in the other version's
+  spelling are translated; received codes the version does not define become `GenericError`
+  with `originalErrorCode`.
+- `CentralSystem` serves OCPP 1.6 and 2.0.1 on one port with
+  `protocols: ['ocpp2.0.1', 'ocpp1.6']` (the server's order of preference). 2.0.1 handlers and
+  calls go through `cs.v201`; connections are `ChargePointConnection` or
+  `ChargingStationConnection` and carry `version`.
+- `ChargingStation`, the OCPP 2.0.1 client, and `OcppClient`, the base class it shares with
+  `ChargePoint`. TransactionEvent goes through the offline queue; a full queue evicts only
+  periodic and clock-aligned `Updated` events (`evictMeterValueUpdates`).
+- `SimulatedChargingStation`: EVSEs, a Device Model with the standard controller variables,
+  TransactionEvent driven by TxStartPoint and TxStopPoint, offline queueing, authorization
+  (Local Authorization List, Authorization Cache, group idTokens), smart charging with the K01
+  rules and external constraints, availability, reservations, firmware updates, log uploads,
+  NotifyEvent, SecurityEventNotification and a seeded autopilot. `Fleet` runs either kind or
+  both (`create`, `chargerFactory`, `stationFactory`).
+- CLI: `ocpp-kit sim --ocpp 1.6|2.0.1|mixed`; `ocpp-kit csms` serves both versions by default
+  (`--ocpp both|1.6|2.0.1`), shows each charger's version and maps its commands to it;
+  `ocpp-kit conform --ocpp 2.0.1`.
+- Conformance: `ocpp201Conformance`, 32 checks of a 2.0.1 CSMS, among them TransactionEvent
+  Started/Updated/Ended, offline and replayed events, main-meter MeterValues and
+  `rpc.error-codes`. The connection and RPC checks are shared factories in
+  `src/conformance/common`. CI runs both suites against the demo CSMS.
+- Metrics and logs work on a Central System of either version.
+- Benchmarks of the 2.0.1 TransactionEvent (parse, serialise, validate, in-memory round trip)
+  and a mixed 1.6/2.0.1 fleet; `examples/multi-version.ts`; `docs/ocpp201-field-notes.md`.
+
+### Changed
+
+- `RpcError.code` and `CallErrorFrame.errorCode` are `RpcErrorCode` (the union of the 1.6 and
+  2.0.1 codes) instead of `OcppErrorCode`. Code that switches on them over the 1.6 codes still
+  compiles; code that assigns them to an `OcppErrorCode` needs a check such as
+  `isOcppErrorCode`.
+- `QueuedMessage`, `OfflineQueue` and `QueueInsertion` take the action type as a parameter
+  (default: the 1.6 transaction actions); `OfflineQueueStore.load()` and `save()` use
+  `QueuedMessage<string>`, so a custom store must accept the actions of either version.
+- `FleetStats.connectorStatuses` is keyed by the 1.6 and the 2.0.1 connector statuses;
+  `Fleet`, `FleetOptions` and `FleetEvents` take the member type as a parameter (default:
+  `SimulatedCharger`).
+- `DemoCsms` accepts both versions by default (`protocols` option).
+- The smart-charging evaluation (`evaluateProfile`, `compositePeriods`, `maxMinFairShare`, ...)
+  is a version-neutral engine shared by both simulators.
+- `requireAcceptedBoot` keeps registrations per subprotocol and identity.
+
+### Fixed
+
+- A transaction message queued right before `close()` was lost instead of being kept in the
+  queue (in 0.2.0's `ChargePoint` too).
+- GetCompositeSchedule could report two periods with the same `startPeriod` when two
+  breakpoints less than a second apart rounded to the same second.
+
 ## 0.2.0 - 2026-09-25
 
 ### Added

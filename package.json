@@ -1,14 +1,16 @@
 {
   "name": "ocpp-kit",
-  "version": "0.2.0",
-  "description": "Type-safe OCPP 1.6-J toolkit for Node.js: RPC framing, Central System server, Charge Point client, a charge-point simulator for load testing and a conformance checker for Central Systems.",
+  "version": "0.3.0",
+  "description": "Type-safe OCPP 1.6-J and OCPP 2.0.1 toolkit for Node.js: RPC framing, a Central System serving both versions, clients, simulators for load testing mixed fleets and a conformance checker for Central Systems.",
   "keywords": [
     "ocpp",
     "ocpp16",
+    "ocpp201",
     "ocpp-j",
     "ev-charging",
     "csms",
     "charge-point",
+    "charging-station",
     "websocket",
     "simulator",
     "typescript",
